@@ -25,11 +25,14 @@ coverage.xml
 .env
 .env.*
 !.env.example
+.local/
 *.pem
 *.key
 
 # Terraform
 .terraform/
+terraform/**/.terraform/
+terraform/**/*-config
 *.tfstate
 *.tfstate.*
 .terraform.lock.hcl
@@ -37,7 +40,9 @@ crash.log
 override.tf
 override.tf.json
 *.tfvars
+*.tfvars.json
 !*.tfvars.example
+!*.tfvars.json.example
 
 # OS & editors
 .DS_Store
