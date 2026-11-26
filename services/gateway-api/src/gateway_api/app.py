@@ -10,6 +10,7 @@ import httpx
 from fastapi import FastAPI, Request, Response, status
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from gateway_api.auth import AuthVerifier, GatewayAuthError, authenticate_and_authorize
 from gateway_api.config import ControlPlaneSettings
 from platform_common import (
     ChatCompletionRequest,
@@ -42,6 +43,7 @@ def create_app(
     """Create a Control Plane FastAPI application with an atomically loaded Policy Bundle."""
     resolved_settings = settings or ControlPlaneSettings()
     loaded_policy: LoadedPolicyBundle = load_policy_bundle(resolved_settings.policy_bundle_path)
+    auth_verifier = AuthVerifier(resolved_settings)
     owns_http_client = http_client is None
 
     resolved_http_client = http_client or httpx.AsyncClient(
@@ -65,7 +67,29 @@ def create_app(
     )
     app.state.settings = resolved_settings
     app.state.policy_bundle = loaded_policy
+    app.state.auth_verifier = auth_verifier
     app.state.http_client = resolved_http_client
+
+    @app.exception_handler(GatewayAuthError)
+    async def handle_gateway_auth_error(
+        _request: Request,
+        exc: GatewayAuthError,
+    ) -> JSONResponse:
+        headers = {"x-policy-version": loaded_policy.policy_version}
+        if exc.status_code == status.HTTP_401_UNAUTHORIZED:
+            headers["www-authenticate"] = "Bearer"
+        if exc.denial_reason:
+            headers["x-policy-denial-reason"] = exc.denial_reason
+        return JSONResponse(
+            status_code=exc.status_code,
+            content=build_openai_error(
+                exc.message,
+                exc.error_type,
+                code=exc.code,
+                param=exc.param,
+            ),
+            headers=headers,
+        )
 
     @app.get("/healthz")
     async def healthz() -> dict[str, str]:
@@ -96,9 +120,11 @@ def create_app(
         payload: ChatCompletionRequest,
         request: Request,
     ) -> Response:
+        effective_model = await authenticate_and_authorize(request, payload.model)
         forward_headers = _build_model_router_headers(request, resolved_settings)
         response_headers = {"x-policy-version": loaded_policy.policy_version}
         body = payload.model_dump(exclude_none=True)
+        body["model"] = effective_model
         timeout_seconds = resolved_settings.model_router_timeout_seconds
 
         if payload.stream:

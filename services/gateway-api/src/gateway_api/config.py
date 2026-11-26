@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -17,3 +18,19 @@ class ControlPlaneSettings(BaseSettings):
     model_router_api_key: str | None = None
     model_router_timeout_seconds: float = 30.0
     mock_mode_enabled: bool = True
+
+    # Credential authentication settings
+    api_keys_path: Path | None = None
+    api_keys_json: str | None = None
+    api_keys: dict[str, dict[str, Any]] | None = None
+
+    jwt_issuer: str = "https://auth.ai-gateway.local"
+    jwt_audience: str = "ai-enablement-gateway"
+    jwt_jwks_url: str | None = None
+    jwt_jwks_json: str | None = None
+    jwt_jwks: dict[str, Any] | None = None
+    jwt_jwks_cache_ttl_seconds: int = 300
+    jwt_leeway_seconds: int = 0
+
+    jwt_hs256_enabled: bool = False
+    jwt_hs256_secret: str | None = None

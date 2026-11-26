@@ -11,8 +11,21 @@ from gateway_api.app import create_app
 from gateway_api.config import ControlPlaneSettings
 from mock_llm.app import create_app as create_mock_provider_app
 from mock_llm.config import MockProviderSettings
+from scripts.generate_test_keys import generate_rsa_keypair, mint_rs256_jwt
 
 POLICY_BUNDLE_PATH = Path(__file__).resolve().parent.parent / "policies" / "policy-bundle.yaml"
+
+
+def _test_auth_bundle() -> tuple[dict[str, object], dict[str, str]]:
+    keypair = generate_rsa_keypair()
+    credential = mint_rs256_jwt(
+        private_pem=keypair.private_pem,
+        kid=keypair.kid,
+        actor_id="tracer-bullet-dev",
+        team="platform-eng",
+        role="developer",
+    )
+    return keypair.jwks, {"Authorization": f"Bearer {credential}"}
 
 
 async def test_healthz_and_readyz_expose_deterministic_policy_version() -> None:
@@ -76,6 +89,7 @@ def test_control_plane_fails_fast_on_missing_policy_bundle(tmp_path: Path) -> No
 
 async def test_json_chat_completion_flows_through_control_plane_to_mock_provider() -> None:
     expected_version = f"v1+{hashlib.sha256(POLICY_BUNDLE_PATH.read_bytes()).hexdigest()[:8]}"
+    jwks, auth_headers = _test_auth_bundle()
     mock_app = create_mock_provider_app(
         settings=MockProviderSettings(provider_name="mock-llm-primary", mock_mode_enabled=True)
     )
@@ -83,6 +97,7 @@ async def test_json_chat_completion_flows_through_control_plane_to_mock_provider
         settings=ControlPlaneSettings(
             policy_bundle_path=POLICY_BUNDLE_PATH,
             model_router_base_url="http://mock-provider",
+            jwt_jwks=jwks,
         ),
         model_router_transport=httpx.ASGITransport(app=mock_app),
     )
@@ -100,8 +115,8 @@ async def test_json_chat_completion_flows_through_control_plane_to_mock_provider
         transport=httpx.ASGITransport(app=control_plane_app),
         base_url="http://control-plane",
     ) as client:
-        resp_one = await client.post("/v1/chat/completions", json=payload)
-        resp_two = await client.post("/v1/chat/completions", json=payload)
+        resp_one = await client.post("/v1/chat/completions", json=payload, headers=auth_headers)
+        resp_two = await client.post("/v1/chat/completions", json=payload, headers=auth_headers)
 
     assert resp_one.status_code == 200
     assert resp_one.headers["x-policy-version"] == expected_version
@@ -129,6 +144,7 @@ async def test_json_chat_completion_flows_through_control_plane_to_mock_provider
 
 
 async def test_json_chat_completion_respects_max_tokens_cap() -> None:
+    jwks, auth_headers = _test_auth_bundle()
     mock_app = create_mock_provider_app(
         settings=MockProviderSettings(provider_name="mock-llm-primary", mock_mode_enabled=True)
     )
@@ -136,6 +152,7 @@ async def test_json_chat_completion_respects_max_tokens_cap() -> None:
         settings=ControlPlaneSettings(
             policy_bundle_path=POLICY_BUNDLE_PATH,
             model_router_base_url="http://mock-provider",
+            jwt_jwks=jwks,
         ),
         model_router_transport=httpx.ASGITransport(app=mock_app),
     )
@@ -150,7 +167,7 @@ async def test_json_chat_completion_respects_max_tokens_cap() -> None:
         transport=httpx.ASGITransport(app=control_plane_app),
         base_url="http://control-plane",
     ) as client:
-        resp = await client.post("/v1/chat/completions", json=payload)
+        resp = await client.post("/v1/chat/completions", json=payload, headers=auth_headers)
 
     assert resp.status_code == 200
     body = resp.json()
@@ -162,6 +179,7 @@ async def test_json_chat_completion_respects_max_tokens_cap() -> None:
 
 async def test_sse_streaming_chat_completion_flows_through_control_plane() -> None:
     expected_version = f"v1+{hashlib.sha256(POLICY_BUNDLE_PATH.read_bytes()).hexdigest()[:8]}"
+    jwks, auth_headers = _test_auth_bundle()
     mock_app = create_mock_provider_app(
         settings=MockProviderSettings(provider_name="mock-llm-primary", mock_mode_enabled=True)
     )
@@ -169,6 +187,7 @@ async def test_sse_streaming_chat_completion_flows_through_control_plane() -> No
         settings=ControlPlaneSettings(
             policy_bundle_path=POLICY_BUNDLE_PATH,
             model_router_base_url="http://mock-provider",
+            jwt_jwks=jwks,
         ),
         model_router_transport=httpx.ASGITransport(app=mock_app),
     )
@@ -182,6 +201,7 @@ async def test_sse_streaming_chat_completion_flows_through_control_plane() -> No
         json_resp = await client.post(
             "/v1/chat/completions",
             json={"model": "chat-default", "messages": messages, "stream": False},
+            headers=auth_headers,
         )
         assert json_resp.status_code == 200
         expected_content = json_resp.json()["choices"][0]["message"]["content"]
@@ -196,6 +216,7 @@ async def test_sse_streaming_chat_completion_flows_through_control_plane() -> No
                 "stream": True,
                 "stream_options": {"include_usage": True},
             },
+            headers=auth_headers,
         ) as sse_resp:
             assert sse_resp.status_code == 200
             assert sse_resp.headers["content-type"].startswith("text/event-stream")
@@ -232,6 +253,7 @@ async def test_sse_streaming_chat_completion_flows_through_control_plane() -> No
 
 
 async def test_mock_behavior_fail_503_propagates_for_json_and_sse() -> None:
+    jwks, auth_headers = _test_auth_bundle()
     mock_app = create_mock_provider_app(
         settings=MockProviderSettings(provider_name="mock-llm-primary", mock_mode_enabled=True)
     )
@@ -240,6 +262,7 @@ async def test_mock_behavior_fail_503_propagates_for_json_and_sse() -> None:
             policy_bundle_path=POLICY_BUNDLE_PATH,
             model_router_base_url="http://mock-provider",
             mock_mode_enabled=True,
+            jwt_jwks=jwks,
         ),
         model_router_transport=httpx.ASGITransport(app=mock_app),
     )
@@ -255,7 +278,7 @@ async def test_mock_behavior_fail_503_propagates_for_json_and_sse() -> None:
                 "messages": [{"role": "user", "content": "Trigger 503"}],
                 "stream": False,
             },
-            headers={"X-Mock-Behavior": "fail_503"},
+            headers={**auth_headers, "X-Mock-Behavior": "fail_503"},
         )
         assert json_resp.status_code == 503
         assert json_resp.json()["error"]["code"] == "mock_fault_503"
@@ -267,13 +290,14 @@ async def test_mock_behavior_fail_503_propagates_for_json_and_sse() -> None:
                 "messages": [{"role": "user", "content": "Trigger streaming 503"}],
                 "stream": True,
             },
-            headers={"X-Mock-Behavior": "fail_503"},
+            headers={**auth_headers, "X-Mock-Behavior": "fail_503"},
         )
         assert sse_resp.status_code == 503
         assert sse_resp.json()["error"]["code"] == "mock_fault_503"
 
 
 async def test_mock_behavior_latency_and_timeout_directives() -> None:
+    jwks, auth_headers = _test_auth_bundle()
     mock_app = create_mock_provider_app(
         settings=MockProviderSettings(
             provider_name="mock-llm-primary",
@@ -287,6 +311,7 @@ async def test_mock_behavior_latency_and_timeout_directives() -> None:
             model_router_base_url="http://mock-provider",
             model_router_timeout_seconds=0.1,
             mock_mode_enabled=True,
+            jwt_jwks=jwks,
         ),
         model_router_transport=httpx.ASGITransport(app=mock_app),
     )
@@ -302,7 +327,7 @@ async def test_mock_behavior_latency_and_timeout_directives() -> None:
                 "model": "chat-fast",
                 "messages": [{"role": "user", "content": "Add deterministic latency"}],
             },
-            headers={"X-Mock-Behavior": "latency_ms=40"},
+            headers={**auth_headers, "X-Mock-Behavior": "latency_ms=40"},
         )
         elapsed_ms = (time.monotonic() - started) * 1000
         assert latency_resp.status_code == 200
@@ -314,13 +339,14 @@ async def test_mock_behavior_latency_and_timeout_directives() -> None:
                 "model": "chat-fast",
                 "messages": [{"role": "user", "content": "Trigger provider timeout"}],
             },
-            headers={"X-Mock-Behavior": "timeout"},
+            headers={**auth_headers, "X-Mock-Behavior": "timeout"},
         )
         assert timeout_resp.status_code == 504
         assert timeout_resp.json()["error"]["code"] == "provider_timeout"
 
 
 async def test_mock_behavior_header_ignored_when_mock_mode_disabled() -> None:
+    jwks, auth_headers = _test_auth_bundle()
     mock_app = create_mock_provider_app(
         settings=MockProviderSettings(provider_name="mock-llm-primary", mock_mode_enabled=True)
     )
@@ -329,6 +355,7 @@ async def test_mock_behavior_header_ignored_when_mock_mode_disabled() -> None:
             policy_bundle_path=POLICY_BUNDLE_PATH,
             model_router_base_url="http://mock-provider",
             mock_mode_enabled=False,
+            jwt_jwks=jwks,
         ),
         model_router_transport=httpx.ASGITransport(app=mock_app),
     )
@@ -343,12 +370,13 @@ async def test_mock_behavior_header_ignored_when_mock_mode_disabled() -> None:
                 "model": "chat-default",
                 "messages": [{"role": "user", "content": "Header must be ignored"}],
             },
-            headers={"X-Mock-Behavior": "fail_503"},
+            headers={**auth_headers, "X-Mock-Behavior": "fail_503"},
         )
         assert resp.status_code == 200
 
 
 async def test_admin_fault_toggle_induces_and_recovers_sustained_503_window() -> None:
+    jwks, auth_headers = _test_auth_bundle()
     mock_app = create_mock_provider_app(
         settings=MockProviderSettings(provider_name="mock-llm-primary", mock_mode_enabled=True)
     )
@@ -356,6 +384,7 @@ async def test_admin_fault_toggle_induces_and_recovers_sustained_503_window() ->
         settings=ControlPlaneSettings(
             policy_bundle_path=POLICY_BUNDLE_PATH,
             model_router_base_url="http://mock-provider",
+            jwt_jwks=jwks,
         ),
         model_router_transport=httpx.ASGITransport(app=mock_app),
     )
@@ -383,6 +412,7 @@ async def test_admin_fault_toggle_induces_and_recovers_sustained_503_window() ->
                 "model": "chat-default",
                 "messages": [{"role": "user", "content": "Request during outage"}],
             },
+            headers=auth_headers,
         )
         assert failed_resp.status_code == 503
 
@@ -399,5 +429,6 @@ async def test_admin_fault_toggle_induces_and_recovers_sustained_503_window() ->
                 "model": "chat-default",
                 "messages": [{"role": "user", "content": "Request after recovery"}],
             },
+            headers=auth_headers,
         )
         assert recovered_resp.status_code == 200
