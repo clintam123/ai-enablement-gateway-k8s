@@ -1,0 +1,44 @@
+[project]
+name = "ai-enablement-gateway"
+version = "0.1.0"
+description = "Governed LLM Control Plane, stateless Model Router, and guarded MCP Runtime"
+requires-python = ">=3.12"
+dependencies = [
+    "platform-common",
+    "gateway-api",
+    "mock-llm",
+]
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28.1",
+    "pytest>=8.3.4",
+    "pytest-asyncio>=0.25.2",
+    "ruff>=0.8.6",
+]
+
+[tool.uv.workspace]
+members = [
+    "packages/*",
+    "services/*",
+]
+
+[tool.uv.sources]
+platform-common = { workspace = true }
+gateway-api = { workspace = true }
+mock-llm = { workspace = true }
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["platform_common", "gateway_api", "mock_llm"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
