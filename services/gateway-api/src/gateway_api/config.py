@@ -39,3 +39,7 @@ class ControlPlaneSettings(BaseSettings):
     redis_url: str | None = None
     redis_socket_timeout_seconds: float = 1.0
     require_redis: bool = True
+
+    # OpenTelemetry tracing settings
+    otel_service_name: str = "gateway-api"
+    otel_exporter_otlp_endpoint: str | None = None

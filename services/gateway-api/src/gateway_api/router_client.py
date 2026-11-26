@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import codecs
 import json
+import time
 from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -14,6 +15,7 @@ from fastapi import Request, Response, status
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from gateway_api.config import ControlPlaneSettings
+from gateway_api.telemetry import inject_trace_headers
 from platform_common import ChatCompletionRequest, build_openai_error
 
 
@@ -38,6 +40,7 @@ def build_model_router_headers(
         mock_behavior = request.headers.get("x-mock-behavior")
         if mock_behavior:
             headers["x-mock-behavior"] = mock_behavior
+    inject_trace_headers(headers, request_headers=request.headers)
     return headers
 
 
@@ -96,6 +99,7 @@ def _initialize_request_telemetry(request: Request) -> None:
     request.state.completion_tokens = None
     request.state.total_tokens = None
     request.state.streamed_completion_chars = 0
+    request.state.upstream_duration_seconds = 0.0
 
 
 def _record_routing_metadata(request: Request, metadata: RoutingMetadata) -> None:
@@ -220,12 +224,14 @@ async def forward_chat_completion(
         json=body,
         headers=forward_headers,
     )
+    upstream_started = time.perf_counter()
     try:
         provider_response = await asyncio.wait_for(
             http_client.send(router_request, stream=payload.stream),
             timeout=settings.model_router_timeout_seconds,
         )
     except (httpx.TimeoutException, TimeoutError):
+        request.state.upstream_duration_seconds = max(0.0, time.perf_counter() - upstream_started)
         return _gateway_error_response(
             status_code=status.HTTP_504_GATEWAY_TIMEOUT,
             message="Model Router timed out waiting for Provider response",
@@ -234,6 +240,7 @@ async def forward_chat_completion(
             headers=base_headers,
         )
     except httpx.HTTPError:
+        request.state.upstream_duration_seconds = max(0.0, time.perf_counter() - upstream_started)
         return _gateway_error_response(
             status_code=status.HTTP_502_BAD_GATEWAY,
             message="Model Router is unreachable",
@@ -242,14 +249,21 @@ async def forward_chat_completion(
             headers=base_headers,
         )
 
+    request.state.upstream_duration_seconds = max(0.0, time.perf_counter() - upstream_started)
     metadata = extract_routing_metadata(provider_response.headers, resolved_target_model)
     _record_routing_metadata(request, metadata)
     response_headers = {**base_headers, **routing_response_headers(metadata)}
 
     if payload.stream:
         if provider_response.status_code >= 400:
-            error_body = await provider_response.aread()
-            await provider_response.aclose()
+            error_read_started = time.perf_counter()
+            try:
+                error_body = await provider_response.aread()
+            finally:
+                await provider_response.aclose()
+                request.state.upstream_duration_seconds += max(
+                    0.0, time.perf_counter() - error_read_started
+                )
             return Response(
                 content=error_body,
                 status_code=provider_response.status_code,
@@ -259,13 +273,29 @@ async def forward_chat_completion(
 
         async def stream_passthrough() -> AsyncIterator[bytes]:
             scanner = _SSETelemetryScanner(request)
+            aiter = provider_response.aiter_bytes().__aiter__()
             try:
-                async for chunk in provider_response.aiter_bytes():
+                while True:
+                    wait_started = time.perf_counter()
+                    try:
+                        chunk = await aiter.__anext__()
+                    except StopAsyncIteration:
+                        break
+                    finally:
+                        request.state.upstream_duration_seconds += max(
+                            0.0, time.perf_counter() - wait_started
+                        )
                     scanner.feed(chunk)
                     yield chunk
             finally:
                 scanner.flush()
-                await provider_response.aclose()
+                close_started = time.perf_counter()
+                try:
+                    await provider_response.aclose()
+                finally:
+                    request.state.upstream_duration_seconds += max(
+                        0.0, time.perf_counter() - close_started
+                    )
 
         return StreamingResponse(
             stream_passthrough(),
