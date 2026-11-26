@@ -1,0 +1,52 @@
+# Python & uv
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+ENV/
+env/
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Testing & linting caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+coverage.xml
+
+# Environment & secrets
+.env
+.env.*
+!.env.example
+.local/
+*.pem
+*.key
+
+# Terraform
+.terraform/
+terraform/**/.terraform/
+terraform/**/*-config
+*.tfstate
+*.tfstate.*
+.terraform.lock.hcl
+crash.log
+override.tf
+override.tf.json
+*.tfvars
+*.tfvars.json
+!*.tfvars.example
+!*.tfvars.json.example
+
+# OS & editors
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*.swo

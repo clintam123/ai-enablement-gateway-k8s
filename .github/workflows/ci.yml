@@ -1,0 +1,115 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - feat/**
+  pull_request:
+    branches:
+      - main
+      - feat/**
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate-and-test:
+    name: Lint, Unit Tests, Helm & Terraform Validate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Sync dependencies
+        run: uv sync --locked
+
+      - name: Ruff lint & format check
+        run: |
+          uv run ruff check .
+          uv run ruff format --check .
+
+      - name: Run offline unit & contract tests
+        run: uv run pytest -v
+
+      - name: Cross-validate Policy Bundle & Model Router aliases
+        run: uv run python scripts/validate_aliases.py
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+
+      - name: Lint and render Helm chart
+        run: |
+          helm lint deploy/helm/ai-enablement-platform
+          helm template ai-gateway deploy/helm/ai-enablement-platform --namespace ai-gateway >/dev/null
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.10.5"
+          terraform_wrapper: false
+
+      - name: Format check and validate local Terraform
+        run: |
+          terraform -chdir=terraform/local fmt -check -diff
+          terraform -chdir=terraform/local init -backend=false
+          terraform -chdir=terraform/local validate
+
+  kind-smoke:
+    name: Live Kind + Calico + Traefik Smoke Suite
+    needs: validate-and-test
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Sync dependencies
+        run: uv sync --locked
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.10.5"
+          terraform_wrapper: false
+
+      - name: Install kind CLI
+        run: |
+          curl -fsSL -o /usr/local/bin/kind https://kind.sigs.k8s.io/dl/v0.33.0/kind-linux-amd64
+          chmod +x /usr/local/bin/kind
+          kind version
+
+      - name: Provision Kind + Calico + Traefik + AI Gateway
+        run: make up
+
+      - name: Run live smoke suite
+        run: make smoke
+
+      - name: Collect cluster diagnostics on failure
+        if: failure()
+        run: |
+          kubectl get nodes -o wide || true
+          kubectl get pods -A -o wide || true
+          kubectl get hpa,ingress,networkpolicy -n ai-gateway || true
+          kubectl get events -A --sort-by='.lastTimestamp' | tail -n 50 || true
+          kubectl logs -n ai-gateway deploy/ai-gateway-gateway-api --tail=100 || true
+          kubectl logs -n ai-gateway deploy/ai-gateway-litellm-proxy --tail=100 || true
+          kubectl logs -n traefik deploy/traefik --tail=100 || true
+
+      - name: Tear down local Kind cluster
+        if: always()
+        run: make down

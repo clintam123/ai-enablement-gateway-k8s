@@ -1,0 +1,130 @@
+{{- $component := "litellm-proxy" -}}
+{{- $name := include "ai-enablement-platform.componentName" (dict "root" . "component" $component) -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ai-enablement-platform.labels" . | nindent 4 }}
+    app.kubernetes.io/component: {{ $component }}
+  annotations:
+    checkov.io/skip1: "CKV_K8S_35=LiteLLM Proxy config.yaml uses os.environ/LITELLM_MASTER_KEY and upstream Provider API key env vars per ADR-0001"
+    checkov.io/skip2: "CKV_K8S_43=LiteLLM image is pinned by version tag ghcr.io/berriai/litellm:1.84.0"
+spec:
+  replicas: {{ .Values.litellmProxy.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "ai-enablement-platform.componentSelectorLabels" (dict "Chart" .Chart "Release" .Release "Values" .Values "component" $component) | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "ai-enablement-platform.labels" . | nindent 8 }}
+        app.kubernetes.io/component: {{ $component }}
+      annotations:
+        checksum/litellm-config: {{ include (print $.Template.BasePath "/configmap-litellm.yaml") . | sha256sum }}
+    spec:
+      serviceAccountName: {{ $name }}
+      automountServiceAccountToken: false
+      securityContext:
+        {{- include "ai-enablement-platform.hardenedPodSecurityContext" (dict "uid" 65532) | nindent 8 }}
+      containers:
+        - name: litellm-proxy
+          image: "{{ .Values.litellmProxy.image.repository }}:{{ .Values.litellmProxy.image.tag }}"
+          imagePullPolicy: {{ .Values.litellmProxy.image.pullPolicy }}
+          securityContext:
+            {{- include "ai-enablement-platform.hardenedContainerSecurityContext" (dict "uid" 65532) | nindent 12 }}
+          args:
+            - "--config"
+            - "/app/config.yaml"
+            - "--port"
+            - "4000"
+            - "--num_workers"
+            - "1"
+          ports:
+            - name: http
+              containerPort: 4000
+              protocol: TCP
+          env:
+            - name: LITELLM_NON_ROOT
+              value: "true"
+            - name: LITELLM_LOCAL_MODEL_COST_MAP
+              value: "True"
+            - name: HOME
+              value: "/tmp"
+            - name: XDG_CACHE_HOME
+              value: "/tmp/cache"
+            - name: LITELLM_MIGRATION_DIR
+              value: "/tmp/migrations"
+            - name: PRISMA_BINARY_CACHE_DIR
+              value: "/tmp/cache/prisma"
+            - name: TIKTOKEN_CACHE_DIR
+              value: "/tmp/cache/tiktoken"
+            - name: LITELLM_MASTER_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.router.existingSecret }}
+                  key: {{ .Values.secrets.router.masterKeyKey }}
+          {{- if .Values.secrets.router.providerKeysExistingSecret }}
+          envFrom:
+            - secretRef:
+                name: {{ .Values.secrets.router.providerKeysExistingSecret }}
+                optional: true
+          {{- end }}
+          startupProbe:
+            httpGet:
+              path: /health/liveliness
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 24
+          livenessProbe:
+            httpGet:
+              path: /health/liveliness
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 4
+          readinessProbe:
+            httpGet:
+              path: /health/readiness
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          resources:
+            {{- toYaml .Values.litellmProxy.resources | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /app/config.yaml
+              subPath: config.yaml
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "ai-enablement-platform.litellmConfigMapName" . }}
+        - name: tmp
+          emptyDir:
+            sizeLimit: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ai-enablement-platform.labels" . | nindent 4 }}
+    app.kubernetes.io/component: {{ $component }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "ai-enablement-platform.componentSelectorLabels" (dict "Chart" .Chart "Release" .Release "Values" .Values "component" $component) | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.litellmProxy.service.port }}
+      targetPort: http
+      protocol: TCP

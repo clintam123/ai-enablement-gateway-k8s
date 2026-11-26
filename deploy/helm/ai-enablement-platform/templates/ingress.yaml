@@ -1,0 +1,108 @@
+{{- if .Values.ingress.enabled }}
+{{- $serviceName := include "ai-enablement-platform.componentName" (dict "root" . "component" "gateway-api") -}}
+{{- $servicePort := int .Values.gatewayApi.service.port -}}
+{{- $publicPaths := list "/v1" "/mcp" "/healthz" "/readyz" -}}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ $serviceName }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ai-enablement-platform.labels" . | nindent 4 }}
+    app.kubernetes.io/component: gateway-api
+  {{- with .Values.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  ingressClassName: {{ .Values.ingress.className }}
+  {{- if .Values.ingress.tls }}
+  tls:
+    {{- toYaml .Values.ingress.tls | nindent 4 }}
+  {{- end }}
+  rules:
+    {{- if .Values.ingress.hosts }}
+    {{- range $host := .Values.ingress.hosts }}
+    - host: {{ $host | quote }}
+      http:
+        paths:
+          {{- range $path := $publicPaths }}
+          - path: {{ $path }}
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ $serviceName }}
+                port:
+                  number: {{ $servicePort }}
+          {{- end }}
+    {{- end }}
+    {{- else }}
+    - http:
+        paths:
+          {{- range $path := $publicPaths }}
+          - path: {{ $path }}
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ $serviceName }}
+                port:
+                  number: {{ $servicePort }}
+          {{- end }}
+    {{- end }}
+{{- if .Values.ingress.traefikMiddleware.enabled }}
+{{- $mwName := printf "%s-block-metrics" (include "ai-enablement-platform.fullname" .) | trunc 63 | trimSuffix "-" }}
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: {{ $mwName }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ai-enablement-platform.labels" . | nindent 4 }}
+    app.kubernetes.io/component: gateway-api
+spec:
+  ipAllowList:
+    sourceRange:
+      {{- toYaml .Values.ingress.traefikMiddleware.sourceRange | nindent 6 }}
+    rejectStatusCode: {{ .Values.ingress.traefikMiddleware.rejectStatusCode }}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ $mwName }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ai-enablement-platform.labels" . | nindent 4 }}
+    app.kubernetes.io/component: gateway-api
+  annotations:
+    traefik.ingress.kubernetes.io/router.middlewares: {{ printf "%s-%s@kubernetescrd" .Release.Namespace $mwName | quote }}
+    traefik.ingress.kubernetes.io/router.priority: {{ .Values.ingress.traefikMiddleware.priority | quote }}
+spec:
+  ingressClassName: {{ .Values.ingress.className }}
+  rules:
+    {{- if .Values.ingress.hosts }}
+    {{- range $host := .Values.ingress.hosts }}
+    - host: {{ $host | quote }}
+      http:
+        paths:
+          - path: /metrics
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ $serviceName }}
+                port:
+                  number: {{ $servicePort }}
+    {{- end }}
+    {{- else }}
+    - http:
+        paths:
+          - path: /metrics
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ $serviceName }}
+                port:
+                  number: {{ $servicePort }}
+    {{- end }}
+{{- end }}
+{{- end }}

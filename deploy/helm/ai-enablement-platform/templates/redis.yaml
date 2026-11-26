@@ -1,0 +1,94 @@
+{{- $component := "redis" -}}
+{{- $name := include "ai-enablement-platform.componentName" (dict "root" . "component" $component) -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ai-enablement-platform.labels" . | nindent 4 }}
+    app.kubernetes.io/component: {{ $component }}
+  annotations:
+    checkov.io/skip1: "CKV_K8S_40=Official redis:7.4.2-alpine image creates and runs as built-in redis user UID 999"
+    checkov.io/skip2: "CKV_K8S_43=Redis image is pinned by version tag redis:7.4.2-alpine"
+spec:
+  replicas: {{ .Values.redis.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "ai-enablement-platform.componentSelectorLabels" (dict "Chart" .Chart "Release" .Release "Values" .Values "component" $component) | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "ai-enablement-platform.labels" . | nindent 8 }}
+        app.kubernetes.io/component: {{ $component }}
+    spec:
+      serviceAccountName: {{ $name }}
+      automountServiceAccountToken: false
+      securityContext:
+        {{- include "ai-enablement-platform.hardenedPodSecurityContext" (dict "uid" 999) | nindent 8 }}
+      containers:
+        - name: redis
+          image: "{{ .Values.redis.image.repository }}:{{ .Values.redis.image.tag }}"
+          imagePullPolicy: {{ .Values.redis.image.pullPolicy }}
+          securityContext:
+            {{- include "ai-enablement-platform.hardenedContainerSecurityContext" (dict "uid" 999) | nindent 12 }}
+          args:
+            - "redis-server"
+            - "--save"
+            - ""
+            - "--appendonly"
+            - "no"
+          ports:
+            - name: redis
+              containerPort: 6379
+              protocol: TCP
+          livenessProbe:
+            exec:
+              command:
+                - redis-cli
+                - ping
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            exec:
+              command:
+                - redis-cli
+                - ping
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            {{- toYaml .Values.redis.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: data
+          emptyDir:
+            sizeLimit: 128Mi
+        - name: tmp
+          emptyDir:
+            sizeLimit: 32Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ai-enablement-platform.labels" . | nindent 4 }}
+    app.kubernetes.io/component: {{ $component }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "ai-enablement-platform.componentSelectorLabels" (dict "Chart" .Chart "Release" .Release "Values" .Values "component" $component) | nindent 4 }}
+  ports:
+    - name: redis
+      port: {{ .Values.redis.service.port }}
+      targetPort: redis
+      protocol: TCP
