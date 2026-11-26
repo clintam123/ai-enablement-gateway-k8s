@@ -39,6 +39,8 @@ spec:
             - "/app/config.yaml"
             - "--port"
             - "4000"
+            - "--num_workers"
+            - "1"
           ports:
             - name: http
               containerPort: 4000
@@ -46,6 +48,8 @@ spec:
           env:
             - name: LITELLM_NON_ROOT
               value: "true"
+            - name: LITELLM_LOCAL_MODEL_COST_MAP
+              value: "True"
             - name: HOME
               value: "/tmp"
             - name: XDG_CACHE_HOME
@@ -67,6 +71,13 @@ spec:
                 name: {{ .Values.secrets.router.providerKeysExistingSecret }}
                 optional: true
           {{- end }}
+          startupProbe:
+            httpGet:
+              path: /health/liveliness
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 24
           livenessProbe:
             httpGet:
               path: /health/liveliness

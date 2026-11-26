@@ -289,6 +289,120 @@ def generate_scoped_api_key(
     )
 
 
+DEFAULT_LOCAL_ACTORS: tuple[tuple[str, str, str], ...] = (
+    ("local-platform-admin", "platform-eng", "admin"),
+    ("local-product-dev", "product-eng", "developer"),
+    ("local-ops-user", "ops-eng", "ops"),
+)
+
+
+def generate_litellm_master_key(*, seed: str | None = DEFAULT_SEED) -> str:
+    """Create an internal Model Router master key for local/CI secret bootstrap."""
+    if seed is not None:
+        digest = hashlib.sha256(f"{seed}:litellm-master-key".encode()).hexdigest()[:24]
+    else:
+        digest = secrets.token_hex(12)
+    return f"sk-litellm-{digest}"
+
+
+def write_local_credential_bundle(
+    bundle_dir: Path,
+    *,
+    seed: str | None = DEFAULT_SEED,
+    kid: str = DEFAULT_KEY_ID,
+    issuer: str = DEFAULT_ISSUER,
+    audience: str = DEFAULT_AUDIENCE,
+    ttl_seconds: int = 3600,
+    issued_at: int | None = None,
+) -> dict[str, str]:
+    """Write a complete local Credential bundle and Terraform tfvars into ``bundle_dir``."""
+    bundle_dir.mkdir(parents=True, exist_ok=True)
+    keypair = generate_rsa_keypair(seed=seed, kid=kid)
+    litellm_master_key = generate_litellm_master_key(seed=seed)
+
+    api_keys_store: dict[str, dict[str, Any]] = {}
+    teams_bundle: dict[str, dict[str, Any]] = {}
+    for actor_id, team, role in DEFAULT_LOCAL_ACTORS:
+        api_key = generate_scoped_api_key(
+            actor_id=actor_id,
+            team=team,
+            role=role,
+            seed=seed,
+            label="local-bundle",
+        )
+        api_keys_store[api_key.sha256] = api_key.to_store_entry()
+        rs256_jwt = mint_rs256_jwt(
+            private_pem=keypair.private_pem,
+            kid=kid,
+            actor_id=actor_id,
+            team=team,
+            role=role,
+            issuer=issuer,
+            audience=audience,
+            expires_in_seconds=ttl_seconds,
+            issued_at=issued_at,
+        )
+        teams_bundle[team] = {
+            "actor_id": actor_id,
+            "team": team,
+            "role": role,
+            "api_key": api_key.plaintext_key,
+            "api_key_sha256": api_key.sha256,
+            "rs256_jwt": rs256_jwt,
+        }
+
+    api_keys_doc = {"api_keys": api_keys_store}
+    api_keys_json = json.dumps(api_keys_doc, indent=2, sort_keys=True) + "\n"
+    jwks_json = json.dumps(keypair.jwks, indent=2, sort_keys=True) + "\n"
+
+    credentials_doc = {
+        "kid": keypair.kid,
+        "issuer": issuer,
+        "audience": audience,
+        "jwks": keypair.jwks,
+        "private_pem": keypair.private_pem,
+        "public_pem": keypair.public_pem,
+        "litellm_master_key": litellm_master_key,
+        "teams": teams_bundle,
+    }
+    tfvars_doc = {
+        "gateway_api_keys_json": json.dumps(api_keys_doc, separators=(",", ":"), sort_keys=True),
+        "gateway_jwks_json": json.dumps(keypair.jwks, separators=(",", ":"), sort_keys=True),
+        "litellm_master_key": litellm_master_key,
+    }
+
+    jwks_path = bundle_dir / "jwks.json"
+    private_path = bundle_dir / "private.pem"
+    public_path = bundle_dir / "public.pem"
+    api_keys_path = bundle_dir / "api-keys.json"
+    credentials_path = bundle_dir / "credentials.json"
+    tfvars_path = bundle_dir / "local.tfvars.json"
+
+    jwks_path.write_text(jwks_json, encoding="utf-8")
+    private_path.write_text(keypair.private_pem, encoding="utf-8")
+    public_path.write_text(keypair.public_pem, encoding="utf-8")
+    api_keys_path.write_text(api_keys_json, encoding="utf-8")
+    credentials_path.write_text(
+        json.dumps(credentials_doc, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    tfvars_path.write_text(
+        json.dumps(tfvars_doc, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+
+    for sensitive_path in (private_path, credentials_path, tfvars_path):
+        sensitive_path.chmod(0o600)
+
+    return {
+        "bundle_dir": str(bundle_dir),
+        "jwks_path": str(jwks_path),
+        "private_pem_path": str(private_path),
+        "public_pem_path": str(public_path),
+        "api_keys_path": str(api_keys_path),
+        "credentials_path": str(credentials_path),
+        "tfvars_path": str(tfvars_path),
+    }
+
+
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -321,6 +435,15 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Optional directory to write jwks.json, private.pem, public.pem, and api-keys.yaml.",
     )
+    parser.add_argument(
+        "--write-bundle",
+        type=Path,
+        default=None,
+        help=(
+            "Write a multi-Team local Credential bundle (credentials.json, api-keys.json, "
+            "jwks.json, private.pem, public.pem, and local.tfvars.json)."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -328,6 +451,25 @@ def main(argv: list[str] | None = None) -> int:
     """CLI entrypoint for generating offline test keys and Credentials."""
     args = _parse_args(argv)
     seed = None if args.random else args.seed
+
+    if args.write_bundle is not None:
+        summary = write_local_credential_bundle(
+            args.write_bundle,
+            seed=seed,
+            kid=args.kid,
+            issuer=args.issuer,
+            audience=args.audience,
+            ttl_seconds=args.ttl_seconds,
+            issued_at=args.issued_at,
+        )
+        print(
+            json.dumps(
+                {"teams": [team for _, team, _ in DEFAULT_LOCAL_ACTORS], **summary},
+                indent=2,
+            )
+        )
+        return 0
+
     keypair = generate_rsa_keypair(seed=seed, kid=args.kid)
     rs256_jwt = mint_rs256_jwt(
         private_pem=keypair.private_pem,

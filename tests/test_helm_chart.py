@@ -178,11 +178,19 @@ def test_litellm_proxy_stateless_non_root_and_probe_contract() -> None:
     assert container["image"] == "ghcr.io/berriai/litellm:1.84.0"
     assert container["securityContext"]["runAsUser"] == 65532
     assert container["securityContext"]["runAsGroup"] == 65532
-    assert container["args"] == ["--config", "/app/config.yaml", "--port", "4000"]
+    assert container["args"] == [
+        "--config",
+        "/app/config.yaml",
+        "--port",
+        "4000",
+        "--num_workers",
+        "1",
+    ]
 
     envs = _env_map(container)
     assert "DATABASE_URL" not in envs
     assert envs["LITELLM_NON_ROOT"]["value"] == "true"
+    assert envs["LITELLM_LOCAL_MODEL_COST_MAP"]["value"] == "True"
     assert envs["HOME"]["value"] == "/tmp"
     assert envs["XDG_CACHE_HOME"]["value"] == "/tmp/cache"
     assert envs["LITELLM_MIGRATION_DIR"]["value"] == "/tmp/migrations"
@@ -198,6 +206,7 @@ def test_litellm_proxy_stateless_non_root_and_probe_contract() -> None:
     assert mounts["/app/config.yaml"]["subPath"] == "config.yaml"
     assert "configMap" in volumes[mounts["/app/config.yaml"]["name"]]
 
+    assert container["startupProbe"]["httpGet"]["path"] == "/health/liveliness"
     assert container["livenessProbe"]["httpGet"]["path"] == "/health/liveliness"
     assert container["readinessProbe"]["httpGet"]["path"] == "/health/readiness"
 
