@@ -19,10 +19,23 @@ from gateway_api.config import ControlPlaneSettings
 from mock_llm.app import create_app as create_mock_provider_app
 from mock_llm.config import MockProviderSettings
 from platform_common import load_policy_bundle
+from scripts.generate_test_keys import generate_rsa_keypair, hash_api_key, mint_rs256_jwt
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 POLICY_BUNDLE_PATH = REPO_ROOT / "policies" / "policy-bundle.yaml"
 LITELLM_CONFIG_PATH = REPO_ROOT / "services" / "litellm-proxy" / "config.yaml"
+
+
+def _test_auth_bundle() -> tuple[dict[str, Any], dict[str, str]]:
+    keypair = generate_rsa_keypair()
+    credential = mint_rs256_jwt(
+        private_pem=keypair.private_pem,
+        kid=keypair.kid,
+        actor_id="router-test-actor",
+        team="platform-eng",
+        role="developer",
+    )
+    return keypair.jwks, {"Authorization": f"Bearer {credential}"}
 
 
 def _load_validate_aliases_module() -> ModuleType:
@@ -239,6 +252,7 @@ def _wrap_capture_request_state(asgi_app: Any) -> tuple[Any, list[dict[str, Any]
 
 async def test_control_plane_forwards_master_key_and_records_primary_routing_metadata() -> None:
     observed_requests: list[httpx.Request] = []
+    jwks, auth_headers = _test_auth_bundle()
 
     def handler(request: httpx.Request) -> httpx.Response:
         observed_requests.append(request)
@@ -275,6 +289,7 @@ async def test_control_plane_forwards_master_key_and_records_primary_routing_met
             policy_bundle_path=POLICY_BUNDLE_PATH,
             model_router_base_url="http://litellm-proxy:4000",
             model_router_api_key="master-secret-key",
+            jwt_jwks=jwks,
         ),
         model_router_transport=httpx.MockTransport(handler),
     )
@@ -291,7 +306,7 @@ async def test_control_plane_forwards_master_key_and_records_primary_routing_met
                 "messages": [{"role": "user", "content": "Hello router"}],
                 "stream": False,
             },
-            headers={"Authorization": "Bearer caller-credential-must-not-leak"},
+            headers=auth_headers,
         )
 
     assert resp.status_code == 200
@@ -344,6 +359,8 @@ async def test_control_plane_extracts_routed_model_and_fallback_from_litellm_hea
     expected_routed_model: str,
     expected_fallback: bool,
 ) -> None:
+    jwks, auth_headers = _test_auth_bundle()
+
     def handler(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(
             status_code=200,
@@ -368,6 +385,7 @@ async def test_control_plane_extracts_routed_model_and_fallback_from_litellm_hea
         settings=ControlPlaneSettings(
             policy_bundle_path=POLICY_BUNDLE_PATH,
             model_router_base_url="http://litellm-proxy:4000",
+            jwt_jwks=jwks,
         ),
         model_router_transport=httpx.MockTransport(handler),
     )
@@ -383,6 +401,7 @@ async def test_control_plane_extracts_routed_model_and_fallback_from_litellm_hea
                 "model": "chat-fast",
                 "messages": [{"role": "user", "content": "Test headers"}],
             },
+            headers=auth_headers,
         )
 
     assert resp.status_code == 200
@@ -396,10 +415,19 @@ async def test_control_plane_extracts_routed_model_and_fallback_from_litellm_hea
 
 def _build_asgi_chat_request(
     payload: dict[str, Any],
+    *,
+    extra_headers: dict[str, str] | None = None,
 ) -> tuple[dict[str, Any], Any, asyncio.Event]:
     request_body = json.dumps(payload).encode("utf-8")
     request_sent = False
     disconnect_event = asyncio.Event()
+    headers = [
+        (b"host", b"control-plane"),
+        (b"content-type", b"application/json"),
+        (b"content-length", str(len(request_body)).encode("ascii")),
+    ]
+    for name, value in (extra_headers or {}).items():
+        headers.append((name.lower().encode("latin-1"), value.encode("latin-1")))
     scope = {
         "type": "http",
         "asgi": {"version": "3.0"},
@@ -409,11 +437,7 @@ def _build_asgi_chat_request(
         "path": "/v1/chat/completions",
         "raw_path": b"/v1/chat/completions",
         "query_string": b"",
-        "headers": [
-            (b"host", b"control-plane"),
-            (b"content-type", b"application/json"),
-            (b"content-length", str(len(request_body)).encode("ascii")),
-        ],
+        "headers": headers,
         "server": ("control-plane", 80),
         "client": ("127.0.0.1", 12345),
         "root_path": "",
@@ -470,11 +494,13 @@ async def test_sse_streaming_injects_stream_options_and_records_usage_without_bu
                 stream=_AsyncByteStream(chunks()),
             )
 
+    jwks, auth_headers = _test_auth_bundle()
     app = create_app(
         settings=ControlPlaneSettings(
             policy_bundle_path=POLICY_BUNDLE_PATH,
             model_router_base_url="http://litellm-proxy:4000",
             model_router_api_key="master-secret-key",
+            jwt_jwks=jwks,
         ),
         model_router_transport=_GatedStreamingTransport(),
     )
@@ -485,7 +511,8 @@ async def test_sse_streaming_injects_stream_options_and_records_usage_without_bu
             "model": "chat-default",
             "messages": [{"role": "user", "content": "Stream without stream_options"}],
             "stream": True,
-        }
+        },
+        extra_headers=auth_headers,
     )
     response_headers: dict[str, str] = {}
     response_status: int | None = None
@@ -626,6 +653,7 @@ class _FailoverRouterStubTransport(httpx.AsyncBaseTransport):
 
 
 async def test_primary_to_fallback_failover_with_real_mock_providers_on_fault_and_timeout() -> None:
+    jwks, auth_headers = _test_auth_bundle()
     primary_app = create_mock_provider_app(
         settings=MockProviderSettings(
             provider_name="mock-llm-primary",
@@ -645,6 +673,7 @@ async def test_primary_to_fallback_failover_with_real_mock_providers_on_fault_an
             model_router_base_url="http://litellm-proxy:4000",
             model_router_api_key="master-secret-key",
             mock_mode_enabled=True,
+            jwt_jwks=jwks,
         ),
         model_router_transport=_FailoverRouterStubTransport(primary_app, fallback_app),
     )
@@ -667,6 +696,7 @@ async def test_primary_to_fallback_failover_with_real_mock_providers_on_fault_an
                 "model": "chat-default",
                 "messages": [{"role": "user", "content": "Primary check"}],
             },
+            headers=auth_headers,
         )
         assert primary_resp.status_code == 200
         assert "mock-llm-primary" in primary_resp.json()["choices"][0]["message"]["content"]
@@ -687,6 +717,7 @@ async def test_primary_to_fallback_failover_with_real_mock_providers_on_fault_an
                 "model": "chat-default",
                 "messages": [{"role": "user", "content": "Failover JSON check"}],
             },
+            headers=auth_headers,
         )
         assert fallback_json.status_code == 200
         assert "mock-llm-fallback" in fallback_json.json()["choices"][0]["message"]["content"]
@@ -703,6 +734,7 @@ async def test_primary_to_fallback_failover_with_real_mock_providers_on_fault_an
                 "messages": [{"role": "user", "content": "Failover SSE check"}],
                 "stream": True,
             },
+            headers=auth_headers,
         ) as sse_resp:
             assert sse_resp.status_code == 200
             assert sse_resp.headers["x-routed-model"] == "fallback-1"
@@ -731,7 +763,7 @@ async def test_primary_to_fallback_failover_with_real_mock_providers_on_fault_an
                 "model": "chat-fast",
                 "messages": [{"role": "user", "content": "Timeout failover check"}],
             },
-            headers={"X-Mock-Behavior": "timeout"},
+            headers={**auth_headers, "X-Mock-Behavior": "timeout"},
         )
         assert timeout_failover.status_code == 200
         assert "mock-llm-fallback" in timeout_failover.json()["choices"][0]["message"]["content"]
@@ -769,10 +801,12 @@ async def test_sse_disconnect_tracks_streamed_chars_and_closes_upstream_without_
                 stream=_TrackedStream(),
             )
 
+    jwks, auth_headers = _test_auth_bundle()
     app = create_app(
         settings=ControlPlaneSettings(
             policy_bundle_path=POLICY_BUNDLE_PATH,
             model_router_base_url="http://litellm-proxy:4000",
+            jwt_jwks=jwks,
         ),
         model_router_transport=_DisconnectTransport(),
     )
@@ -783,7 +817,8 @@ async def test_sse_disconnect_tracks_streamed_chars_and_closes_upstream_without_
             "model": "chat-default",
             "messages": [{"role": "user", "content": "Disconnect mid-stream"}],
             "stream": True,
-        }
+        },
+        extra_headers=auth_headers,
     )
 
     async def send(message: dict[str, Any]) -> None:
@@ -805,7 +840,9 @@ async def test_sse_disconnect_tracks_streamed_chars_and_closes_upstream_without_
     assert state["streamed_completion_chars"] == len("partial output")
 
 
-async def test_caller_auth_not_leaked_when_router_key_unset_and_target_model_honored() -> None:
+async def test_caller_auth_not_leaked_when_router_key_unset_and_target_model_honored(
+    tmp_path: Path,
+) -> None:
     observed_requests: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -829,27 +866,32 @@ async def test_caller_auth_not_leaked_when_router_key_unset_and_target_model_hon
             },
         )
 
+    policy_data = yaml.safe_load(POLICY_BUNDLE_PATH.read_text(encoding="utf-8"))
+    policy_data["teams"]["platform-eng"]["allowed_model_aliases"].append("chat-legacy")
+    policy_data["teams"]["platform-eng"]["model_alias_remapping"] = {"chat-legacy": "chat-default"}
+    policy_copy = tmp_path / "policy-bundle.yaml"
+    policy_copy.write_text(yaml.safe_dump(policy_data), encoding="utf-8")
+
+    caller_api_key = "sk-gw-caller-secret"
     app = create_app(
         settings=ControlPlaneSettings(
-            policy_bundle_path=POLICY_BUNDLE_PATH,
+            policy_bundle_path=policy_copy,
             model_router_base_url="http://litellm-proxy:4000",
             model_router_api_key=None,
+            api_keys={
+                hash_api_key(caller_api_key): {
+                    "actor_id": "caller-1",
+                    "team": "platform-eng",
+                    "role": "developer",
+                }
+            },
         ),
         model_router_transport=httpx.MockTransport(handler),
     )
-    captured: list[dict[str, Any]] = []
-
-    async def remap_middleware(scope: dict[str, Any], receive: Any, send: Any) -> None:
-        if scope["type"] == "http":
-            scope.setdefault("state", {})["target_model"] = "chat-default"
-        try:
-            await app(scope, receive, send)
-        finally:
-            if scope["type"] == "http":
-                captured.append(dict(scope.get("state", {})))
+    wrapped_app, captured = _wrap_capture_request_state(app)
 
     async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=remap_middleware),
+        transport=httpx.ASGITransport(app=wrapped_app),
         base_url="http://control-plane",
     ) as client:
         resp = await client.post(
@@ -858,7 +900,7 @@ async def test_caller_auth_not_leaked_when_router_key_unset_and_target_model_hon
                 "model": "chat-legacy",
                 "messages": [{"role": "user", "content": "Remapped"}],
             },
-            headers={"Authorization": "Bearer sk-gw-caller-secret"},
+            headers={"Authorization": f"Bearer {caller_api_key}"},
         )
 
     assert resp.status_code == 200
@@ -867,3 +909,4 @@ async def test_caller_auth_not_leaked_when_router_key_unset_and_target_model_hon
     assert resp.headers["x-routed-model"] == "chat-default"
     assert resp.headers["x-fallback-used"] == "false"
     assert captured[0]["routed_model"] == "chat-default"
+    assert captured[0]["target_model"] == "chat-default"

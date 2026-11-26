@@ -1,1 +1,1 @@
-"""Operational validation scripts."""
+"""Offline developer, validation, and CI helper scripts."""
