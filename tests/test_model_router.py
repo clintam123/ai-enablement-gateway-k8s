@@ -10,6 +10,7 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any
 
+import fakeredis
 import httpx
 import pytest
 import yaml
@@ -292,6 +293,7 @@ async def test_control_plane_forwards_master_key_and_records_primary_routing_met
             jwt_jwks=jwks,
         ),
         model_router_transport=httpx.MockTransport(handler),
+        redis_client=fakeredis.FakeAsyncRedis(decode_responses=True),
     )
     wrapped_app, captured_states = _wrap_capture_request_state(app)
 
@@ -388,6 +390,7 @@ async def test_control_plane_extracts_routed_model_and_fallback_from_litellm_hea
             jwt_jwks=jwks,
         ),
         model_router_transport=httpx.MockTransport(handler),
+        redis_client=fakeredis.FakeAsyncRedis(decode_responses=True),
     )
     wrapped_app, captured_states = _wrap_capture_request_state(app)
 
@@ -503,6 +506,7 @@ async def test_sse_streaming_injects_stream_options_and_records_usage_without_bu
             jwt_jwks=jwks,
         ),
         model_router_transport=_GatedStreamingTransport(),
+        redis_client=fakeredis.FakeAsyncRedis(decode_responses=True),
     )
     wrapped_app, captured_states = _wrap_capture_request_state(app)
 
@@ -676,6 +680,7 @@ async def test_primary_to_fallback_failover_with_real_mock_providers_on_fault_an
             jwt_jwks=jwks,
         ),
         model_router_transport=_FailoverRouterStubTransport(primary_app, fallback_app),
+        redis_client=fakeredis.FakeAsyncRedis(decode_responses=True),
     )
     wrapped_app, captured_states = _wrap_capture_request_state(control_plane_app)
 
@@ -809,6 +814,7 @@ async def test_sse_disconnect_tracks_streamed_chars_and_closes_upstream_without_
             jwt_jwks=jwks,
         ),
         model_router_transport=_DisconnectTransport(),
+        redis_client=fakeredis.FakeAsyncRedis(decode_responses=True),
     )
     wrapped_app, captured_states = _wrap_capture_request_state(app)
 
@@ -887,6 +893,7 @@ async def test_caller_auth_not_leaked_when_router_key_unset_and_target_model_hon
             },
         ),
         model_router_transport=httpx.MockTransport(handler),
+        redis_client=fakeredis.FakeAsyncRedis(decode_responses=True),
     )
     wrapped_app, captured = _wrap_capture_request_state(app)
 

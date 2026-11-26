@@ -11,6 +11,7 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
+import fakeredis
 import httpx
 import pytest
 import yaml
@@ -97,6 +98,7 @@ async def test_allowed_request_emits_audit_event_and_health_endpoints_do_not(
         ),
         model_router_transport=recorder,
         audit_sink=events,
+        redis_client=fakeredis.FakeAsyncRedis(decode_responses=True),
     )
 
     messages = [{"role": "user", "content": "Summarize our Kubernetes rollout checklist."}]
@@ -177,6 +179,7 @@ async def test_pii_redaction_scrubs_email_phone_and_ssn_before_model_router() ->
         ),
         model_router_transport=recorder,
         audit_sink=events,
+        redis_client=fakeredis.FakeAsyncRedis(decode_responses=True),
     )
 
     raw_email = "alice.engineer@corp.example.com"
@@ -275,6 +278,7 @@ async def test_redact_rule_without_explicit_replacement_uses_default_placeholder
         ),
         model_router_transport=recorder,
         audit_sink=events,
+        redis_client=fakeredis.FakeAsyncRedis(decode_responses=True),
     )
 
     async with httpx.AsyncClient(
@@ -316,6 +320,7 @@ async def test_blocked_prompt_deny_returns_403_before_model_router_and_emits_aud
         ),
         model_router_transport=recorder,
         audit_sink=events,
+        redis_client=fakeredis.FakeAsyncRedis(decode_responses=True),
     )
 
     blocked_prompt = (
@@ -397,6 +402,7 @@ async def test_multiple_matching_deny_rules_record_all_rule_ids_and_entity_types
         ),
         model_router_transport=recorder,
         audit_sink=events,
+        redis_client=fakeredis.FakeAsyncRedis(decode_responses=True),
     )
 
     async with httpx.AsyncClient(
@@ -513,6 +519,7 @@ async def test_sse_streaming_with_pii_redaction_has_zero_buffering_and_accurate_
         ),
         model_router_transport=_GatedStreamingTransport(),
         audit_sink=events,
+        redis_client=fakeredis.FakeAsyncRedis(decode_responses=True),
     )
 
     raw_email = "stream-user@example.org"
@@ -602,6 +609,7 @@ async def test_sse_mid_stream_disconnect_emits_audit_event_with_estimated_tokens
         ),
         model_router_transport=_DisconnectTransport(),
         audit_sink=events,
+        redis_client=fakeredis.FakeAsyncRedis(decode_responses=True),
     )
 
     scope, receive, disconnect_event = _build_asgi_post_request(
@@ -656,6 +664,7 @@ async def test_remapped_model_alias_prices_using_effective_model_alias(
         ),
         model_router_transport=httpx.ASGITransport(app=mock_app),
         audit_sink=events,
+        redis_client=fakeredis.FakeAsyncRedis(decode_responses=True),
     )
 
     async with httpx.AsyncClient(
@@ -704,6 +713,7 @@ async def test_auth_401_and_rbac_403_emit_privacy_safe_audit_events() -> None:
         ),
         model_router_transport=recorder,
         audit_sink=events,
+        redis_client=fakeredis.FakeAsyncRedis(decode_responses=True),
     )
 
     async with httpx.AsyncClient(
@@ -798,6 +808,7 @@ async def test_upstream_502_503_504_failures_emit_audit_events_preserving_policy
         ),
         model_router_transport=transport,
         audit_sink=events,
+        redis_client=fakeredis.FakeAsyncRedis(decode_responses=True),
     )
 
     async with httpx.AsyncClient(
@@ -871,6 +882,7 @@ async def test_traceparent_extraction_and_async_callable_audit_sink() -> None:
         ),
         model_router_transport=httpx.ASGITransport(app=mock_app),
         audit_sink=async_sink,
+        redis_client=fakeredis.FakeAsyncRedis(decode_responses=True),
     )
 
     valid_trace_id = "4bf92f3577b34da6a3ce929d0e0e4736"
@@ -936,6 +948,7 @@ async def test_audit_events_and_logs_never_leak_prompts_pii_responses_or_credent
         ),
         model_router_transport=httpx.ASGITransport(app=mock_app),
         audit_sink=events,
+        redis_client=fakeredis.FakeAsyncRedis(decode_responses=True),
     )
 
     secret_prompt_marker = "CONFIDENTIAL_PROJECT_ORION_PROMPT"

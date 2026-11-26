@@ -9,6 +9,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+import fakeredis
 import httpx
 import jwt
 import pytest
@@ -62,6 +63,7 @@ def _make_gateway_and_recorder(
     app = create_app(
         settings=ControlPlaneSettings(**settings_kwargs),  # type: ignore[arg-type]
         model_router_transport=recorder,
+        redis_client=fakeredis.FakeAsyncRedis(decode_responses=True),
     )
     return app, recorder
 

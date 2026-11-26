@@ -34,3 +34,8 @@ class ControlPlaneSettings(BaseSettings):
 
     jwt_hs256_enabled: bool = False
     jwt_hs256_secret: str | None = None
+
+    # Redis Budget Quota & RPM settings
+    redis_url: str | None = None
+    redis_socket_timeout_seconds: float = 1.0
+    require_redis: bool = True

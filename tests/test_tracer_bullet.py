@@ -4,6 +4,7 @@ import re
 import time
 from pathlib import Path
 
+import fakeredis
 import httpx
 import pytest
 
@@ -36,7 +37,8 @@ async def test_healthz_and_readyz_expose_deterministic_policy_version() -> None:
         settings=ControlPlaneSettings(
             policy_bundle_path=POLICY_BUNDLE_PATH,
             model_router_base_url="http://mock-provider",
-        )
+        ),
+        redis_client=fakeredis.FakeAsyncRedis(decode_responses=True),
     )
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app),
@@ -65,7 +67,8 @@ async def test_policy_version_changes_when_policy_bundle_content_changes(tmp_pat
         settings=ControlPlaneSettings(
             policy_bundle_path=bundle_copy,
             model_router_base_url="http://mock-provider",
-        )
+        ),
+        redis_client=fakeredis.FakeAsyncRedis(decode_responses=True),
     )
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app),
@@ -100,6 +103,7 @@ async def test_json_chat_completion_flows_through_control_plane_to_mock_provider
             jwt_jwks=jwks,
         ),
         model_router_transport=httpx.ASGITransport(app=mock_app),
+        redis_client=fakeredis.FakeAsyncRedis(decode_responses=True),
     )
 
     payload = {
@@ -155,6 +159,7 @@ async def test_json_chat_completion_respects_max_tokens_cap() -> None:
             jwt_jwks=jwks,
         ),
         model_router_transport=httpx.ASGITransport(app=mock_app),
+        redis_client=fakeredis.FakeAsyncRedis(decode_responses=True),
     )
 
     payload = {
@@ -190,6 +195,7 @@ async def test_sse_streaming_chat_completion_flows_through_control_plane() -> No
             jwt_jwks=jwks,
         ),
         model_router_transport=httpx.ASGITransport(app=mock_app),
+        redis_client=fakeredis.FakeAsyncRedis(decode_responses=True),
     )
 
     messages = [{"role": "user", "content": "Stream a deterministic platform status update."}]
@@ -265,6 +271,7 @@ async def test_mock_behavior_fail_503_propagates_for_json_and_sse() -> None:
             jwt_jwks=jwks,
         ),
         model_router_transport=httpx.ASGITransport(app=mock_app),
+        redis_client=fakeredis.FakeAsyncRedis(decode_responses=True),
     )
 
     async with httpx.AsyncClient(
@@ -314,6 +321,7 @@ async def test_mock_behavior_latency_and_timeout_directives() -> None:
             jwt_jwks=jwks,
         ),
         model_router_transport=httpx.ASGITransport(app=mock_app),
+        redis_client=fakeredis.FakeAsyncRedis(decode_responses=True),
     )
 
     async with httpx.AsyncClient(
@@ -358,6 +366,7 @@ async def test_mock_behavior_header_ignored_when_mock_mode_disabled() -> None:
             jwt_jwks=jwks,
         ),
         model_router_transport=httpx.ASGITransport(app=mock_app),
+        redis_client=fakeredis.FakeAsyncRedis(decode_responses=True),
     )
 
     async with httpx.AsyncClient(
@@ -387,6 +396,7 @@ async def test_admin_fault_toggle_induces_and_recovers_sustained_503_window() ->
             jwt_jwks=jwks,
         ),
         model_router_transport=httpx.ASGITransport(app=mock_app),
+        redis_client=fakeredis.FakeAsyncRedis(decode_responses=True),
     )
 
     async with (
