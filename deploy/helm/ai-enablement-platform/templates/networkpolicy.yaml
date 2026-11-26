@@ -1,0 +1,230 @@
+{{- if .Values.networkPolicy.enabled }}
+{{- $root := . -}}
+{{- $fullname := include "ai-enablement-platform.fullname" . -}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $fullname }}-default-deny
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ai-enablement-platform.labels" . | nindent 4 }}
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $fullname }}-dns-egress
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ai-enablement-platform.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "ai-enablement-platform.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+    matchExpressions:
+      - key: app.kubernetes.io/component
+        operator: In
+        values:
+          - gateway-api
+          - litellm-proxy
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "ai-enablement-platform.componentName" (dict "root" . "component" "gateway-api") }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ai-enablement-platform.labels" . | nindent 4 }}
+    app.kubernetes.io/component: gateway-api
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "ai-enablement-platform.componentSelectorLabels" (dict "Chart" .Chart "Release" .Release "Values" .Values "component" "gateway-api") | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicy.ingressNamespaceSelector | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.gatewayApi.service.port }}
+    {{- if .Values.networkPolicy.allowObservabilityScrape }}
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicy.observabilityNamespaceSelector | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.gatewayApi.service.port }}
+    {{- end }}
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "ai-enablement-platform.componentSelectorLabels" (dict "Chart" .Chart "Release" .Release "Values" .Values "component" "litellm-proxy") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.litellmProxy.service.port }}
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "ai-enablement-platform.componentSelectorLabels" (dict "Chart" .Chart "Release" .Release "Values" .Values "component" "redis") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.redis.service.port }}
+    {{- if .Values.networkPolicy.allowOtlpEgress }}
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicy.observabilityNamespaceSelector | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 4317
+        - protocol: TCP
+          port: 4318
+    {{- end }}
+    {{- if .Values.networkPolicy.allowExternalJwksEgress }}
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 169.254.0.0/16
+              - 127.0.0.0/8
+      ports:
+        - protocol: TCP
+          port: 443
+    {{- end }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "ai-enablement-platform.componentName" (dict "root" . "component" "litellm-proxy") }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ai-enablement-platform.labels" . | nindent 4 }}
+    app.kubernetes.io/component: litellm-proxy
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "ai-enablement-platform.componentSelectorLabels" (dict "Chart" .Chart "Release" .Release "Values" .Values "component" "litellm-proxy") | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "ai-enablement-platform.componentSelectorLabels" (dict "Chart" .Chart "Release" .Release "Values" .Values "component" "gateway-api") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.litellmProxy.service.port }}
+  egress:
+    {{- if .Values.mockLlm.primary.enabled }}
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "ai-enablement-platform.componentSelectorLabels" (dict "Chart" .Chart "Release" .Release "Values" .Values "component" "mock-llm-primary") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.mockLlm.primary.port }}
+    {{- end }}
+    {{- if .Values.mockLlm.fallback.enabled }}
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "ai-enablement-platform.componentSelectorLabels" (dict "Chart" .Chart "Release" .Release "Values" .Values "component" "mock-llm-fallback") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.mockLlm.fallback.port }}
+    {{- end }}
+    {{- if .Values.networkPolicy.allowExternalProviderEgress }}
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 169.254.0.0/16
+              - 127.0.0.0/8
+      ports:
+        - protocol: TCP
+          port: 443
+    {{- end }}
+{{- $mockTargets := list (dict "component" "mock-llm-primary" "cfg" .Values.mockLlm.primary) (dict "component" "mock-llm-fallback" "cfg" .Values.mockLlm.fallback) -}}
+{{- range $mockTargets }}
+{{- if .cfg.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "ai-enablement-platform.componentName" (dict "root" $root "component" .component) }}
+  namespace: {{ $root.Release.Namespace }}
+  labels:
+    {{- include "ai-enablement-platform.labels" $root | nindent 4 }}
+    app.kubernetes.io/component: {{ .component }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "ai-enablement-platform.componentSelectorLabels" (dict "Chart" $root.Chart "Release" $root.Release "Values" $root.Values "component" .component) | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "ai-enablement-platform.componentSelectorLabels" (dict "Chart" $root.Chart "Release" $root.Release "Values" $root.Values "component" "litellm-proxy") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ .cfg.port }}
+{{- end }}
+{{- end }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "ai-enablement-platform.componentName" (dict "root" . "component" "redis") }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ai-enablement-platform.labels" . | nindent 4 }}
+    app.kubernetes.io/component: redis
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "ai-enablement-platform.componentSelectorLabels" (dict "Chart" .Chart "Release" .Release "Values" .Values "component" "redis") | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "ai-enablement-platform.componentSelectorLabels" (dict "Chart" .Chart "Release" .Release "Values" .Values "component" "gateway-api") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.redis.service.port }}
+{{- end }}

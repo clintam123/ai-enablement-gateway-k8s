@@ -1,0 +1,6 @@
+apiVersion: v2
+name: ai-enablement-platform
+description: Governed LLM Control Plane, stateless Model Router, deterministic Mock Providers, and Redis Quota Store
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

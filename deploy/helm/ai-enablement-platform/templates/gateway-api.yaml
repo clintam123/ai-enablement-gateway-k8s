@@ -1,0 +1,153 @@
+{{- $component := "gateway-api" -}}
+{{- $name := include "ai-enablement-platform.componentName" (dict "root" . "component" $component) -}}
+{{- $routerService := include "ai-enablement-platform.componentName" (dict "root" . "component" "litellm-proxy") -}}
+{{- $redisService := include "ai-enablement-platform.componentName" (dict "root" . "component" "redis") -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ai-enablement-platform.labels" . | nindent 4 }}
+    app.kubernetes.io/component: {{ $component }}
+  annotations:
+    checkov.io/skip1: "CKV_K8S_35=Control Plane reads Model Router API key and optional static JWKS via Secret env vars while API keys mount as a read-only file"
+    checkov.io/skip2: "CKV_K8S_43=Image tag is parameterized for local Kind builds and immutable release tags"
+spec:
+  {{- if not .Values.gatewayApi.autoscaling.enabled }}
+  replicas: {{ .Values.gatewayApi.replicaCount }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "ai-enablement-platform.componentSelectorLabels" (dict "Chart" .Chart "Release" .Release "Values" .Values "component" $component) | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "ai-enablement-platform.labels" . | nindent 8 }}
+        app.kubernetes.io/component: {{ $component }}
+      annotations:
+        checksum/policy-bundle: {{ include (print $.Template.BasePath "/configmap-policy-bundle.yaml") . | sha256sum }}
+        {{- if .Values.observability.prometheusScrape }}
+        prometheus.io/scrape: "true"
+        prometheus.io/port: {{ .Values.gatewayApi.service.port | quote }}
+        prometheus.io/path: "/metrics"
+        {{- end }}
+    spec:
+      serviceAccountName: {{ $name }}
+      automountServiceAccountToken: false
+      securityContext:
+        {{- include "ai-enablement-platform.hardenedPodSecurityContext" (dict "uid" 10001) | nindent 8 }}
+      containers:
+        - name: gateway-api
+          image: "{{ .Values.gatewayApi.image.repository }}:{{ .Values.gatewayApi.image.tag }}"
+          imagePullPolicy: {{ .Values.gatewayApi.image.pullPolicy }}
+          securityContext:
+            {{- include "ai-enablement-platform.hardenedContainerSecurityContext" (dict "uid" 10001) | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+          env:
+            - name: HOME
+              value: "/tmp"
+            - name: GATEWAY_POLICY_BUNDLE_PATH
+              value: "/etc/gateway/policy-bundle.yaml"
+            - name: GATEWAY_MODEL_ROUTER_BASE_URL
+              value: {{ printf "http://%s:%d" $routerService (int .Values.litellmProxy.service.port) | quote }}
+            - name: GATEWAY_REDIS_URL
+              value: {{ printf "redis://%s:%d/0" $redisService (int .Values.redis.service.port) | quote }}
+            - name: GATEWAY_REQUIRE_REDIS
+              value: "true"
+            - name: GATEWAY_MOCK_MODE_ENABLED
+              value: {{ .Values.gatewayApi.mockModeEnabled | quote }}
+            - name: GATEWAY_API_KEYS_PATH
+              value: {{ printf "/etc/gateway/secrets/%s" .Values.secrets.gateway.apiKeysKey | quote }}
+            - name: GATEWAY_JWT_ISSUER
+              value: {{ .Values.gatewayApi.jwt.issuer | quote }}
+            - name: GATEWAY_JWT_AUDIENCE
+              value: {{ .Values.gatewayApi.jwt.audience | quote }}
+            - name: GATEWAY_JWT_JWKS_JSON
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.gateway.existingSecret }}
+                  key: {{ .Values.secrets.gateway.jwksKey }}
+                  optional: true
+            - name: GATEWAY_MODEL_ROUTER_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.gateway.existingSecret }}
+                  key: {{ .Values.secrets.gateway.routerApiKeyKey }}
+            {{- if .Values.gatewayApi.jwt.jwksUrl }}
+            - name: GATEWAY_JWT_JWKS_URL
+              value: {{ .Values.gatewayApi.jwt.jwksUrl | quote }}
+            {{- end }}
+            {{- if .Values.gatewayApi.jwt.hs256Enabled }}
+            - name: GATEWAY_JWT_HS256_ENABLED
+              value: "true"
+            {{- end }}
+            {{- if .Values.observability.otlpEndpoint }}
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: {{ .Values.observability.otlpEndpoint | quote }}
+            {{- end }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            {{- toYaml .Values.gatewayApi.resources | nindent 12 }}
+          volumeMounts:
+            - name: policy-bundle
+              mountPath: /etc/gateway/policy-bundle.yaml
+              subPath: policy-bundle.yaml
+              readOnly: true
+            - name: gateway-secrets
+              mountPath: /etc/gateway/secrets
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: policy-bundle
+          configMap:
+            name: {{ include "ai-enablement-platform.policyBundleConfigMapName" . }}
+        - name: gateway-secrets
+          secret:
+            secretName: {{ .Values.secrets.gateway.existingSecret }}
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ai-enablement-platform.labels" . | nindent 4 }}
+    app.kubernetes.io/component: {{ $component }}
+  {{- if .Values.observability.prometheusScrape }}
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: {{ .Values.gatewayApi.service.port | quote }}
+    prometheus.io/path: "/metrics"
+  {{- end }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "ai-enablement-platform.componentSelectorLabels" (dict "Chart" .Chart "Release" .Release "Values" .Values "component" $component) | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.gatewayApi.service.port }}
+      targetPort: http
+      protocol: TCP

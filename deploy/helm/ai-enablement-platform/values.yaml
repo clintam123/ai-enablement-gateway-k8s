@@ -1,0 +1,133 @@
+nameOverride: ""
+fullnameOverride: ""
+
+configMaps:
+  immutable: true
+  policyBundleOverride: ""
+  litellmConfigOverride: ""
+
+secrets:
+  gateway:
+    existingSecret: ai-gateway-credentials
+    apiKeysKey: api-keys.json
+    jwksKey: jwks.json
+    routerApiKeyKey: litellm-master-key
+  router:
+    existingSecret: ai-gateway-router-credentials
+    masterKeyKey: litellm-master-key
+    providerKeysExistingSecret: ""
+
+gatewayApi:
+  image:
+    repository: ai-gateway-api
+    tag: "dev"
+    pullPolicy: IfNotPresent
+  replicaCount: 1
+  service:
+    port: 8000
+  mockModeEnabled: true
+  jwt:
+    issuer: "https://auth.ai-gateway.local"
+    audience: "ai-enablement-gateway"
+    jwksUrl: ""
+    hs256Enabled: false
+  autoscaling:
+    enabled: true
+    minReplicas: 1
+    maxReplicas: 4
+    targetCPUUtilizationPercentage: 50
+    scaleUpStabilizationWindowSeconds: 15
+    scaleDownStabilizationWindowSeconds: 60
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+litellmProxy:
+  image:
+    repository: ghcr.io/berriai/litellm
+    tag: "1.84.0"
+    pullPolicy: IfNotPresent
+  replicaCount: 1
+  service:
+    port: 4000
+  resources:
+    requests:
+      cpu: 150m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+mockLlm:
+  image:
+    repository: ai-mock-llm
+    tag: "dev"
+    pullPolicy: IfNotPresent
+  mockModeEnabled: true
+  primary:
+    enabled: true
+    replicaCount: 1
+    serviceName: mock-llm-primary
+    providerName: mock-llm-primary
+    port: 8000
+  fallback:
+    enabled: true
+    replicaCount: 1
+    serviceName: mock-llm-fallback
+    providerName: mock-llm-fallback
+    port: 8000
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 250m
+      memory: 256Mi
+
+redis:
+  image:
+    repository: redis
+    tag: "7.4.2-alpine"
+    pullPolicy: IfNotPresent
+  replicaCount: 1
+  service:
+    port: 6379
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 250m
+      memory: 256Mi
+
+ingress:
+  enabled: true
+  className: traefik
+  annotations: {}
+  hosts: []
+  tls: []
+  traefikMiddleware:
+    enabled: false
+    sourceRange:
+      - 127.0.0.1/32
+    rejectStatusCode: 404
+    priority: 100
+
+observability:
+  otlpEndpoint: ""
+  prometheusScrape: true
+
+networkPolicy:
+  enabled: true
+  ingressNamespaceSelector:
+    kubernetes.io/metadata.name: traefik
+  allowObservabilityScrape: true
+  observabilityNamespaceSelector:
+    kubernetes.io/metadata.name: observability
+  allowOtlpEgress: false
+  allowExternalJwksEgress: false
+  allowExternalProviderEgress: false

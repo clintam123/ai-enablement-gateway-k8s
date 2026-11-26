@@ -1,0 +1,99 @@
+{{- $root := . -}}
+{{- $instances := list (dict "component" "mock-llm-primary" "cfg" .Values.mockLlm.primary) (dict "component" "mock-llm-fallback" "cfg" .Values.mockLlm.fallback) -}}
+{{- $rendered := false -}}
+{{- range $instances -}}
+{{- if .cfg.enabled -}}
+{{- if $rendered }}
+---
+{{- end }}
+{{- $rendered = true -}}
+{{- $component := .component -}}
+{{- $cfg := .cfg -}}
+{{- $name := include "ai-enablement-platform.componentName" (dict "root" $root "component" $component) }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  namespace: {{ $root.Release.Namespace }}
+  labels:
+    {{- include "ai-enablement-platform.labels" $root | nindent 4 }}
+    app.kubernetes.io/component: {{ $component }}
+  annotations:
+    checkov.io/skip1: "CKV_K8S_43=Image tag is parameterized for local Kind builds and immutable release tags"
+spec:
+  replicas: {{ $cfg.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "ai-enablement-platform.componentSelectorLabels" (dict "Chart" $root.Chart "Release" $root.Release "Values" $root.Values "component" $component) | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "ai-enablement-platform.labels" $root | nindent 8 }}
+        app.kubernetes.io/component: {{ $component }}
+    spec:
+      serviceAccountName: {{ $name }}
+      automountServiceAccountToken: false
+      securityContext:
+        {{- include "ai-enablement-platform.hardenedPodSecurityContext" (dict "uid" 10001) | nindent 8 }}
+      containers:
+        - name: mock-llm
+          image: "{{ $root.Values.mockLlm.image.repository }}:{{ $root.Values.mockLlm.image.tag }}"
+          imagePullPolicy: {{ $root.Values.mockLlm.image.pullPolicy }}
+          securityContext:
+            {{- include "ai-enablement-platform.hardenedContainerSecurityContext" (dict "uid" 10001) | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+          env:
+            - name: HOME
+              value: "/tmp"
+            - name: MOCK_LLM_PROVIDER_NAME
+              value: {{ $cfg.providerName | quote }}
+            - name: MOCK_LLM_MOCK_MODE_ENABLED
+              value: {{ $root.Values.mockLlm.mockModeEnabled | quote }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            {{- toYaml $root.Values.mockLlm.resources | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 32Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $cfg.serviceName }}
+  namespace: {{ $root.Release.Namespace }}
+  labels:
+    {{- include "ai-enablement-platform.labels" $root | nindent 4 }}
+    app.kubernetes.io/component: {{ $component }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "ai-enablement-platform.componentSelectorLabels" (dict "Chart" $root.Chart "Release" $root.Release "Values" $root.Values "component" $component) | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ $cfg.port }}
+      targetPort: http
+      protocol: TCP
+{{- end -}}
+{{- end -}}
