@@ -10,8 +10,15 @@ import uuid
 from collections.abc import Callable
 from typing import Any
 
+from opentelemetry import trace
+from opentelemetry.trace import SpanKind, Status, StatusCode, TracerProvider
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from gateway_api.telemetry import (
+    ControlPlaneMetrics,
+    annotate_span_from_event,
+    extract_trace_context,
+)
 from platform_common import ActorContext, AuditEvent, LoadedPolicyBundle, PolicyBundle
 
 AUDIT_LOGGER_NAME = "gateway_api.audit"
@@ -107,6 +114,9 @@ def _initialize_audit_state(
     state.setdefault("prompt_tokens", None)
     state.setdefault("completion_tokens", None)
     state.setdefault("streamed_completion_chars", 0)
+    state.setdefault("stream", False)
+    state.setdefault("upstream_duration_seconds", 0.0)
+    state.setdefault("policy_denial_reason", None)
     state.setdefault("tool_name", None)
     state.setdefault("run_id", None)
 
@@ -200,18 +210,24 @@ class AuditMiddleware:
         *,
         emitter: AuditEmitter,
         loaded_policy: LoadedPolicyBundle,
+        metrics: ControlPlaneMetrics | None = None,
+        tracer_provider: TracerProvider | None = None,
     ) -> None:
         self.app = app
         self.emitter = emitter
         self.loaded_policy = loaded_policy
+        self.metrics = metrics
+        self.tracer_provider = tracer_provider or trace.NoOpTracerProvider()
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if scope["type"] != "http" or not is_governed_path(scope.get("path", "")):
+        path = scope.get("path", "")
+        if scope["type"] != "http" or not is_governed_path(path):
             await self.app(scope, receive, send)
             return
 
+        headers = scope.get("headers", ())
         state = scope.setdefault("state", {})
-        _initialize_audit_state(state, scope.get("headers", ()))
+        _initialize_audit_state(state, headers)
 
         started_at = time.perf_counter()
         status_code: int | None = None
@@ -222,15 +238,55 @@ class AuditMiddleware:
                 status_code = int(message["status"])
             await send(message)
 
-        try:
-            await self.app(scope, receive, send_wrapper)
-        finally:
-            latency_ms = (time.perf_counter() - started_at) * 1000.0
-            final_status = status_code if status_code is not None else 500
-            event = _build_audit_event(
-                state=state,
-                loaded_policy=self.loaded_policy,
-                status_code=final_status,
-                latency_ms=latency_ms,
-            )
-            await self.emitter.emit(event)
+        span_name = "gateway.mcp" if path == "/mcp" or path.startswith("/mcp/") else "gateway.chat"
+        tracer = self.tracer_provider.get_tracer("gateway_api.telemetry")
+        parent_ctx = extract_trace_context(headers)
+
+        with tracer.start_as_current_span(
+            span_name,
+            context=parent_ctx,
+            kind=SpanKind.SERVER,
+        ) as span:
+            span_ctx = span.get_span_context()
+            if span_ctx.is_valid:
+                state["trace_id"] = f"{span_ctx.trace_id:032x}"
+            had_exception = False
+            try:
+                await self.app(scope, receive, send_wrapper)
+            except BaseException as exc:
+                had_exception = True
+                if span.is_recording():
+                    span.set_attribute("error.type", type(exc).__name__)
+                    span.set_status(Status(StatusCode.ERROR, type(exc).__name__))
+                raise
+            finally:
+                latency_seconds = max(0.0, time.perf_counter() - started_at)
+                final_status = status_code if status_code is not None else 500
+                event = _build_audit_event(
+                    state=state,
+                    loaded_policy=self.loaded_policy,
+                    status_code=final_status,
+                    latency_ms=latency_seconds * 1000.0,
+                )
+                route_obj = scope.get("route")
+                route = getattr(route_obj, "path", None) or path or "/"
+                annotate_span_from_event(
+                    span,
+                    route=route,
+                    event=event,
+                    stream=bool(state.get("stream", False)),
+                    had_exception=had_exception,
+                )
+                if self.metrics is not None:
+                    self.metrics.observe(
+                        event,
+                        route=route,
+                        stream=bool(state.get("stream", False)),
+                        duration_seconds=latency_seconds,
+                        upstream_duration_seconds=float(
+                            state.get("upstream_duration_seconds") or 0.0
+                        ),
+                        effective_model=state.get("effective_model") or state.get("target_model"),
+                        denial_reason=state.get("policy_denial_reason"),
+                    )
+                await self.emitter.emit(event)

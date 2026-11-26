@@ -10,7 +10,11 @@ requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.115.6",
     "httpx>=0.28.1",
+    "opentelemetry-api>=1.29.0",
+    "opentelemetry-exporter-otlp-proto-http>=1.29.0",
+    "opentelemetry-sdk>=1.29.0",
     "platform-common",
+    "prometheus-client>=0.21.0",
     "pydantic>=2.10.4",
     "pydantic-settings>=2.7.1",
     "redis>=5.0.0",

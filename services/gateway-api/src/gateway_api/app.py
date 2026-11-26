@@ -11,6 +11,8 @@ import httpx
 import redis.asyncio as aioredis
 from fastapi import FastAPI, Request, Response, status
 from fastapi.responses import JSONResponse, StreamingResponse
+from opentelemetry import trace
+from opentelemetry.trace import TracerProvider
 
 from gateway_api.audit import AuditEmitter, AuditMiddleware, AuditSink
 from gateway_api.auth import AuthVerifier, GatewayAuthError, authenticate_and_authorize
@@ -25,6 +27,7 @@ from gateway_api.quotas import (
     wrap_streaming_response,
 )
 from gateway_api.router_client import forward_chat_completion
+from gateway_api.telemetry import ControlPlaneMetrics, init_tracer_provider
 from platform_common import (
     ChatCompletionRequest,
     LoadedPolicyBundle,
@@ -40,12 +43,25 @@ def create_app(
     http_client: httpx.AsyncClient | None = None,
     audit_sink: AuditSink | None = None,
     redis_client: Any | None = None,
+    tracer_provider: TracerProvider | None = None,
+    metrics: ControlPlaneMetrics | None = None,
 ) -> FastAPI:
     """Create a Control Plane FastAPI application with an atomically loaded Policy Bundle."""
     resolved_settings = settings or ControlPlaneSettings()
     loaded_policy: LoadedPolicyBundle = load_policy_bundle(resolved_settings.policy_bundle_path)
     auth_verifier = AuthVerifier(resolved_settings)
     audit_emitter = AuditEmitter(audit_sink)
+    resolved_metrics = metrics or ControlPlaneMetrics()
+    owns_tracer_provider = False
+    if tracer_provider is not None:
+        resolved_tracer_provider = tracer_provider
+    else:
+        otlp_provider = init_tracer_provider(resolved_settings)
+        if otlp_provider is not None:
+            resolved_tracer_provider = otlp_provider
+            owns_tracer_provider = True
+        else:
+            resolved_tracer_provider = trace.NoOpTracerProvider()
     owns_http_client = http_client is None
     owns_redis_client = False
 
@@ -74,6 +90,10 @@ def create_app(
                 await resolved_http_client.aclose()
             if owns_redis_client and resolved_redis_client is not None:
                 await resolved_redis_client.aclose()
+            if owns_tracer_provider:
+                shutdown = getattr(resolved_tracer_provider, "shutdown", None)
+                if callable(shutdown):
+                    shutdown()
 
     app = FastAPI(
         title="AI Enablement Gateway — Control Plane",
@@ -84,6 +104,8 @@ def create_app(
     app.state.policy_bundle = loaded_policy
     app.state.auth_verifier = auth_verifier
     app.state.audit_emitter = audit_emitter
+    app.state.metrics = resolved_metrics
+    app.state.tracer_provider = resolved_tracer_provider
     app.state.http_client = resolved_http_client
     app.state.redis_client = resolved_redis_client
 
@@ -91,6 +113,8 @@ def create_app(
         AuditMiddleware,
         emitter=audit_emitter,
         loaded_policy=loaded_policy,
+        metrics=resolved_metrics,
+        tracer_provider=resolved_tracer_provider,
     )
 
     @app.exception_handler(GatewayAuthError)
@@ -102,6 +126,8 @@ def create_app(
         reason = exc.denial_reason or exc.code
         if reason:
             request.state.triggered_rules = [reason]
+            if exc.status_code == status.HTTP_403_FORBIDDEN:
+                request.state.policy_denial_reason = reason
         headers = {"x-policy-version": loaded_policy.policy_version}
         if exc.status_code == status.HTTP_401_UNAUTHORIZED:
             headers["www-authenticate"] = "Bearer"
@@ -120,9 +146,10 @@ def create_app(
 
     @app.exception_handler(GuardrailDeniedError)
     async def handle_guardrail_denied_error(
-        _request: Request,
+        request: Request,
         exc: GuardrailDeniedError,
     ) -> JSONResponse:
+        request.state.policy_denial_reason = exc.rule_id
         return JSONResponse(
             status_code=status.HTTP_403_FORBIDDEN,
             content=build_openai_error(
@@ -151,6 +178,8 @@ def create_app(
             if reason not in existing_rules:
                 existing_rules.append(reason)
             request.state.triggered_rules = existing_rules
+            if exc.status_code in (status.HTTP_403_FORBIDDEN, status.HTTP_429_TOO_MANY_REQUESTS):
+                request.state.policy_denial_reason = reason
         headers = {"x-policy-version": loaded_policy.policy_version, **exc.headers}
         if exc.denial_reason and "x-policy-denial-reason" not in headers:
             headers["x-policy-denial-reason"] = exc.denial_reason
@@ -167,6 +196,11 @@ def create_app(
     @app.get("/healthz")
     async def healthz() -> dict[str, str]:
         return {"status": "ok"}
+
+    @app.get("/metrics")
+    async def metrics_endpoint() -> Response:
+        payload, media_type = resolved_metrics.render_latest()
+        return Response(content=payload, media_type=media_type)
 
     @app.get("/readyz")
     async def readyz() -> JSONResponse:
@@ -210,6 +244,7 @@ def create_app(
         request: Request,
     ) -> Response:
         request.state.requested_model = payload.model
+        request.state.stream = bool(payload.stream)
         effective_model = await authenticate_and_authorize(request, payload.model)
         decision = evaluate_guardrails(payload, loaded_policy.bundle)
         request.state.policy_action = decision.policy_action
