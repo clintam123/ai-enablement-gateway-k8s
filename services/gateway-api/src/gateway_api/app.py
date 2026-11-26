@@ -4,13 +4,24 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from typing import Any
 
+import anyio
 import httpx
+import redis.asyncio as aioredis
 from fastapi import FastAPI, Request, Response, status
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from gateway_api.auth import AuthVerifier, GatewayAuthError, authenticate_and_authorize
 from gateway_api.config import ControlPlaneSettings
+from gateway_api.quotas import (
+    GatewayQuotaError,
+    ensure_redis_ready,
+    reconcile_non_streaming_response,
+    reconcile_quota,
+    reserve_quota,
+    wrap_streaming_response,
+)
 from gateway_api.router_client import forward_chat_completion
 from platform_common import (
     ChatCompletionRequest,
@@ -25,18 +36,30 @@ def create_app(
     *,
     model_router_transport: httpx.AsyncBaseTransport | None = None,
     http_client: httpx.AsyncClient | None = None,
+    redis_client: Any | None = None,
 ) -> FastAPI:
     """Create a Control Plane FastAPI application with an atomically loaded Policy Bundle."""
     resolved_settings = settings or ControlPlaneSettings()
     loaded_policy: LoadedPolicyBundle = load_policy_bundle(resolved_settings.policy_bundle_path)
     auth_verifier = AuthVerifier(resolved_settings)
     owns_http_client = http_client is None
+    owns_redis_client = False
 
     resolved_http_client = http_client or httpx.AsyncClient(
         base_url=resolved_settings.model_router_base_url.rstrip("/"),
         timeout=httpx.Timeout(resolved_settings.model_router_timeout_seconds),
         transport=model_router_transport,
     )
+
+    resolved_redis_client = redis_client
+    if resolved_redis_client is None and resolved_settings.redis_url:
+        resolved_redis_client = aioredis.from_url(
+            resolved_settings.redis_url,
+            decode_responses=True,
+            socket_timeout=resolved_settings.redis_socket_timeout_seconds,
+            socket_connect_timeout=resolved_settings.redis_socket_timeout_seconds,
+        )
+        owns_redis_client = True
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
@@ -45,6 +68,8 @@ def create_app(
         finally:
             if owns_http_client and not resolved_http_client.is_closed:
                 await resolved_http_client.aclose()
+            if owns_redis_client and resolved_redis_client is not None:
+                await resolved_redis_client.aclose()
 
     app = FastAPI(
         title="AI Enablement Gateway — Control Plane",
@@ -55,6 +80,7 @@ def create_app(
     app.state.policy_bundle = loaded_policy
     app.state.auth_verifier = auth_verifier
     app.state.http_client = resolved_http_client
+    app.state.redis_client = resolved_redis_client
 
     @app.exception_handler(GatewayAuthError)
     async def handle_gateway_auth_error(
@@ -77,6 +103,24 @@ def create_app(
             headers=headers,
         )
 
+    @app.exception_handler(GatewayQuotaError)
+    async def handle_gateway_quota_error(
+        _request: Request,
+        exc: GatewayQuotaError,
+    ) -> JSONResponse:
+        headers = {"x-policy-version": loaded_policy.policy_version, **exc.headers}
+        if exc.denial_reason and "x-policy-denial-reason" not in headers:
+            headers["x-policy-denial-reason"] = exc.denial_reason
+        return JSONResponse(
+            status_code=exc.status_code,
+            content=build_openai_error(
+                exc.message,
+                exc.error_type,
+                code=exc.code,
+            ),
+            headers=headers,
+        )
+
     @app.get("/healthz")
     async def healthz() -> dict[str, str]:
         return {"status": "ok"}
@@ -93,6 +137,22 @@ def create_app(
                     code="policy_not_loaded",
                 ),
             )
+        current_redis = getattr(app.state, "redis_client", None)
+        if resolved_settings.require_redis or current_redis is not None:
+            try:
+                await ensure_redis_ready(
+                    current_redis,
+                    timeout_seconds=resolved_settings.redis_socket_timeout_seconds,
+                )
+            except GatewayQuotaError as exc:
+                return JSONResponse(
+                    status_code=exc.status_code,
+                    content=build_openai_error(
+                        exc.message,
+                        exc.error_type,
+                        code=exc.code,
+                    ),
+                )
         return JSONResponse(
             status_code=status.HTTP_200_OK,
             content={
@@ -108,13 +168,55 @@ def create_app(
     ) -> Response:
         effective_model = await authenticate_and_authorize(request, payload.model)
         target_model = getattr(request.state, "target_model", None) or effective_model
-        return await forward_chat_completion(
-            payload=payload,
+        current_redis = getattr(app.state, "redis_client", None)
+        reservation = await reserve_quota(
             request=request,
-            settings=resolved_settings,
-            http_client=resolved_http_client,
-            policy_version=loaded_policy.policy_version,
-            target_model=target_model,
+            payload=payload,
+            actor=request.state.actor,
+            model_alias=target_model,
+            loaded_policy=loaded_policy,
+            redis_client=current_redis,
+            require_redis=resolved_settings.require_redis,
+            timeout_seconds=resolved_settings.redis_socket_timeout_seconds,
         )
+        try:
+            response = await forward_chat_completion(
+                payload=payload,
+                request=request,
+                settings=resolved_settings,
+                http_client=resolved_http_client,
+                policy_version=loaded_policy.policy_version,
+                target_model=target_model,
+            )
+        except BaseException:
+            if reservation is not None:
+                with anyio.CancelScope(shield=True):
+                    await reconcile_quota(
+                        request=request,
+                        reservation=reservation,
+                        redis_client=current_redis,
+                        timeout_seconds=resolved_settings.redis_socket_timeout_seconds,
+                        prompt_tokens=0,
+                        completion_tokens=0,
+                    )
+            raise
+
+        if reservation is not None:
+            if isinstance(response, StreamingResponse):
+                return wrap_streaming_response(
+                    request=request,
+                    response=response,
+                    reservation=reservation,
+                    redis_client=current_redis,
+                    timeout_seconds=resolved_settings.redis_socket_timeout_seconds,
+                )
+            await reconcile_non_streaming_response(
+                request=request,
+                response=response,
+                reservation=reservation,
+                redis_client=current_redis,
+                timeout_seconds=resolved_settings.redis_socket_timeout_seconds,
+            )
+        return response
 
     return app
