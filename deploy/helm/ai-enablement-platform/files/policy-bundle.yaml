@@ -1,0 +1,105 @@
+schema_version: v1
+
+defaults:
+  default_max_tokens_ceiling: 512
+  requests_per_minute: 60
+  daily_budget_usd: 10.0
+
+models:
+  chat-default:
+    prompt_usd_per_1k_tokens: 0.0015
+    completion_usd_per_1k_tokens: 0.0060
+    max_tokens_ceiling: 1024
+  chat-fast:
+    prompt_usd_per_1k_tokens: 0.0005
+    completion_usd_per_1k_tokens: 0.0015
+    max_tokens_ceiling: 512
+  chat-premium:
+    prompt_usd_per_1k_tokens: 0.0100
+    completion_usd_per_1k_tokens: 0.0300
+    max_tokens_ceiling: 2048
+
+teams:
+  platform-eng:
+    allowed_model_aliases:
+      - chat-default
+      - chat-fast
+      - chat-premium
+    model_alias_remapping: {}
+    requests_per_minute: 120
+    daily_budget_usd: 25.0
+    mcp_tool_allowlist:
+      developer:
+        - check_model_catalog
+        - query_runbook
+      ops:
+        - check_model_catalog
+        - query_runbook
+        - lookup_service_slo
+      admin:
+        - check_model_catalog
+        - query_runbook
+        - lookup_service_slo
+  product-eng:
+    allowed_model_aliases:
+      - chat-default
+      - chat-fast
+    model_alias_remapping: {}
+    requests_per_minute: 60
+    daily_budget_usd: 10.0
+    mcp_tool_allowlist:
+      developer:
+        - check_model_catalog
+        - query_runbook
+      ops:
+        - check_model_catalog
+        - query_runbook
+        - lookup_service_slo
+      admin:
+        - check_model_catalog
+        - query_runbook
+        - lookup_service_slo
+  ops-eng:
+    allowed_model_aliases:
+      - chat-default
+      - chat-fast
+    model_alias_remapping: {}
+    requests_per_minute: 90
+    daily_budget_usd: 15.0
+    mcp_tool_allowlist:
+      developer:
+        - check_model_catalog
+        - query_runbook
+      ops:
+        - check_model_catalog
+        - query_runbook
+        - lookup_service_slo
+      admin:
+        - check_model_catalog
+        - query_runbook
+        - lookup_service_slo
+
+safety_rules:
+  - id: pii-email
+    pattern: '[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
+    action: redact
+    entity_type: EMAIL
+    replacement: "[REDACTED_EMAIL]"
+    description: Redact email addresses before forwarding prompts to the Model Router
+  - id: pii-phone
+    pattern: '\b(?:\+?1[-.\s]?)?(?:\(?\d{3}\)?[-.\s]?)\d{3}[-.\s]?\d{4}\b'
+    action: redact
+    entity_type: PHONE
+    replacement: "[REDACTED_PHONE]"
+    description: Redact US-format phone numbers before forwarding prompts
+  - id: pii-ssn
+    pattern: '\b\d{3}-\d{2}-\d{4}\b'
+    action: redact
+    entity_type: SSN
+    replacement: "[REDACTED_SSN]"
+    description: Redact SSN-format identifiers before forwarding prompts
+  - id: deny-prompt-exfiltration
+    pattern: '(?i)(?:ignore\s+previous\s+instructions|reveal\s+system\s+prompt|dump\s+all\s+credentials)'
+    action: deny
+    entity_type: BLOCKED_PROMPT
+    description: Block prompt-injection and credential-exfiltration attempts
