@@ -9,8 +9,10 @@ import httpx
 from fastapi import FastAPI, Request, Response, status
 from fastapi.responses import JSONResponse
 
+from gateway_api.audit import AuditEmitter, AuditMiddleware, AuditSink
 from gateway_api.auth import AuthVerifier, GatewayAuthError, authenticate_and_authorize
 from gateway_api.config import ControlPlaneSettings
+from gateway_api.guardrails import GuardrailDeniedError, evaluate_guardrails
 from gateway_api.router_client import forward_chat_completion
 from platform_common import (
     ChatCompletionRequest,
@@ -25,11 +27,13 @@ def create_app(
     *,
     model_router_transport: httpx.AsyncBaseTransport | None = None,
     http_client: httpx.AsyncClient | None = None,
+    audit_sink: AuditSink | None = None,
 ) -> FastAPI:
     """Create a Control Plane FastAPI application with an atomically loaded Policy Bundle."""
     resolved_settings = settings or ControlPlaneSettings()
     loaded_policy: LoadedPolicyBundle = load_policy_bundle(resolved_settings.policy_bundle_path)
     auth_verifier = AuthVerifier(resolved_settings)
+    audit_emitter = AuditEmitter(audit_sink)
     owns_http_client = http_client is None
 
     resolved_http_client = http_client or httpx.AsyncClient(
@@ -54,13 +58,24 @@ def create_app(
     app.state.settings = resolved_settings
     app.state.policy_bundle = loaded_policy
     app.state.auth_verifier = auth_verifier
+    app.state.audit_emitter = audit_emitter
     app.state.http_client = resolved_http_client
+
+    app.add_middleware(
+        AuditMiddleware,
+        emitter=audit_emitter,
+        loaded_policy=loaded_policy,
+    )
 
     @app.exception_handler(GatewayAuthError)
     async def handle_gateway_auth_error(
-        _request: Request,
+        request: Request,
         exc: GatewayAuthError,
     ) -> JSONResponse:
+        request.state.policy_action = "deny"
+        reason = exc.denial_reason or exc.code
+        if reason:
+            request.state.triggered_rules = [reason]
         headers = {"x-policy-version": loaded_policy.policy_version}
         if exc.status_code == status.HTTP_401_UNAUTHORIZED:
             headers["www-authenticate"] = "Bearer"
@@ -75,6 +90,25 @@ def create_app(
                 param=exc.param,
             ),
             headers=headers,
+        )
+
+    @app.exception_handler(GuardrailDeniedError)
+    async def handle_guardrail_denied_error(
+        _request: Request,
+        exc: GuardrailDeniedError,
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=status.HTTP_403_FORBIDDEN,
+            content=build_openai_error(
+                exc.message,
+                exc.error_type,
+                code=exc.code,
+                param=exc.param,
+            ),
+            headers={
+                "x-policy-version": loaded_policy.policy_version,
+                "x-policy-denial-reason": exc.rule_id,
+            },
         )
 
     @app.get("/healthz")
@@ -106,10 +140,18 @@ def create_app(
         payload: ChatCompletionRequest,
         request: Request,
     ) -> Response:
+        request.state.requested_model = payload.model
         effective_model = await authenticate_and_authorize(request, payload.model)
+        decision = evaluate_guardrails(payload, loaded_policy.bundle)
+        request.state.policy_action = decision.policy_action
+        request.state.triggered_rules = list(decision.triggered_rules)
+        request.state.redacted_entity_types = list(decision.redacted_entity_types)
+        request.state.prompt_sha256 = decision.prompt_sha256
+        if decision.policy_action == "deny":
+            raise GuardrailDeniedError(decision)
         target_model = getattr(request.state, "target_model", None) or effective_model
         return await forward_chat_completion(
-            payload=payload,
+            payload=decision.sanitized_payload,
             request=request,
             settings=resolved_settings,
             http_client=resolved_http_client,
