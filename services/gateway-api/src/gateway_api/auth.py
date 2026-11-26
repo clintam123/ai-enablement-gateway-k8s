@@ -366,6 +366,7 @@ def authorize_model_alias(
 
     effective_model = team_policy.model_alias_remapping.get(requested_model, requested_model)
     request.state.effective_model = effective_model
+    request.state.target_model = effective_model
     return effective_model
 
 

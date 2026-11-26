@@ -1,0 +1,106 @@
+# Stateless Model Router (LiteLLM Proxy) configuration per ADR-0001.
+# YAML-only with zero Postgres persistence; upstream Provider keys stay isolated here.
+
+model_list:
+  # Default $0 local deterministic mock Providers (primary -> fallback)
+  - model_name: chat-default
+    litellm_params:
+      model: openai/chat-default
+      api_base: http://mock-llm-primary:8000/v1
+      api_key: mock-unused
+    model_info:
+      id: chat-default-primary
+
+  - model_name: chat-fast
+    litellm_params:
+      model: openai/chat-fast
+      api_base: http://mock-llm-primary:8000/v1
+      api_key: mock-unused
+    model_info:
+      id: chat-fast-primary
+
+  - model_name: chat-premium
+    litellm_params:
+      model: openai/chat-premium
+      api_base: http://mock-llm-primary:8000/v1
+      api_key: mock-unused
+    model_info:
+      id: chat-premium-primary
+
+  # Fallback deployments targeted by litellm_settings.fallbacks
+  - model_name: chat-default-fallback
+    litellm_params:
+      model: openai/chat-default
+      api_base: http://mock-llm-fallback:8000/v1
+      api_key: mock-unused
+    model_info:
+      id: chat-default-fallback
+
+  - model_name: chat-fast-fallback
+    litellm_params:
+      model: openai/chat-fast
+      api_base: http://mock-llm-fallback:8000/v1
+      api_key: mock-unused
+    model_info:
+      id: chat-fast-fallback
+
+  - model_name: chat-premium-fallback
+    litellm_params:
+      model: openai/chat-premium
+      api_base: http://mock-llm-fallback:8000/v1
+      api_key: mock-unused
+    model_info:
+      id: chat-premium-fallback
+
+  # ---------------------------------------------------------------------------
+  # Optional real Provider adapters (commented out by default for $0 startup).
+  # Uncomment and provide the referenced Kubernetes Secret env vars to enable:
+  #
+  # OpenAI adapter (requires OPENAI_API_KEY):
+  # - model_name: chat-premium
+  #   litellm_params:
+  #     model: openai/gpt-4o-mini
+  #     api_key: os.environ/OPENAI_API_KEY
+  #   model_info:
+  #     id: chat-premium-openai
+  #
+  # Google Gemini adapter (requires GEMINI_API_KEY):
+  # - model_name: chat-default
+  #   litellm_params:
+  #     model: gemini/gemini-2.5-flash
+  #     api_key: os.environ/GEMINI_API_KEY
+  #   model_info:
+  #     id: chat-default-gemini
+  #
+  # Self-hosted OpenAI-compatible vLLM adapter (optional VLLM_API_KEY):
+  # - model_name: chat-fast
+  #   litellm_params:
+  #     model: hosted_vllm/Qwen/Qwen2.5-7B-Instruct
+  #     api_base: http://vllm.ai-models.svc.cluster.local:8000/v1
+  #     api_key: os.environ/VLLM_API_KEY
+  #   model_info:
+  #     id: chat-fast-vllm
+  # ---------------------------------------------------------------------------
+
+litellm_settings:
+  drop_params: true
+  num_retries: 2
+  request_timeout: 15
+  fallbacks:
+    - chat-default:
+        - chat-default-fallback
+    - chat-fast:
+        - chat-fast-fallback
+    - chat-premium:
+        - chat-premium-fallback
+
+router_settings:
+  routing_strategy: simple-shuffle
+  num_retries: 2
+  timeout: 15
+  allowed_fails: 3
+  cooldown_time: 30
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+  always_include_stream_usage: true

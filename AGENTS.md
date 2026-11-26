@@ -11,3 +11,7 @@ Canonical triage roles map 1:1 (`needs-triage`, `needs-info`, `ready-for-agent`,
 ### Domain docs
 
 Single-context layout (`GLOSSARY.md` and `docs/adr/` at the repo root). See `docs/agents/domain.md`.
+
+### Third-party API docs
+
+Treat `tech-notes.md` as already Context7-verified; only run `npx ctx7@latest` for APIs or config options not covered there.
