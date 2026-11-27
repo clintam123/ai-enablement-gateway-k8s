@@ -13,7 +13,7 @@ GCP_IMAGE_TAG ?= dev
 ENABLE_GEMINI_PROVIDER ?= false
 GEMINI_API_KEY ?=
 
-.PHONY: dev-creds build-images up down gcp-up gcp-down test lint smoke checkov trivy
+.PHONY: dev-creds build-images up down gcp-up gcp-down test lint smoke bench checkov trivy
 
 dev-creds:
 	uv run python scripts/generate_test_keys.py --write-bundle "$(LOCAL_DIR)"
@@ -106,3 +106,6 @@ trivy: build-images
 
 smoke:
 	uv run python scripts/smoke_test.py
+
+bench:
+	uv run python scripts/run_benchmarks.py
