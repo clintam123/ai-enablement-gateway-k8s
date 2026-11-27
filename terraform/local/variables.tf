@@ -90,3 +90,33 @@ variable "litellm_master_key" {
   default     = ""
   sensitive   = true
 }
+
+variable "enable_observability" {
+  description = "Deploy lightweight single-pod Prometheus, Grafana, and Jaeger OTLP observability stack."
+  type        = bool
+  default     = true
+}
+
+variable "observability_namespace" {
+  description = "Kubernetes namespace for Prometheus, Grafana, and Jaeger workloads."
+  type        = string
+  default     = "observability"
+}
+
+variable "prometheus_image" {
+  description = "Pinned Prometheus container image."
+  type        = string
+  default     = "prom/prometheus:v3.2.1"
+}
+
+variable "grafana_image" {
+  description = "Pinned Grafana container image."
+  type        = string
+  default     = "grafana/grafana:11.5.2"
+}
+
+variable "jaeger_image" {
+  description = "Pinned Jaeger v2 all-in-one OTLP container image."
+  type        = string
+  default     = "cr.jaegertracing.io/jaegertracing/jaeger:2.23.0"
+}
