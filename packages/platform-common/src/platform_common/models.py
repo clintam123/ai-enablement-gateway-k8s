@@ -126,6 +126,7 @@ class AuditEvent(BaseModel):
     estimated_cost_usd: float = Field(default=0.0, ge=0.0)
     latency_ms: float = Field(default=0.0, ge=0.0)
     status_code: int
+    outcome: str | None = None
 
 
 class OpenAIErrorDetail(BaseModel):

@@ -19,6 +19,11 @@ resource "random_password" "litellm_master_key_fallback" {
   special = false
 }
 
+resource "random_password" "internal_identity_secret_fallback" {
+  length  = 48
+  special = false
+}
+
 resource "tls_private_key" "ephemeral_fallback" {
   algorithm = "RSA"
   rsa_bits  = 2048
@@ -35,6 +40,11 @@ locals {
     var.litellm_master_key != ""
     ? var.litellm_master_key
     : "sk-litellm-${random_password.litellm_master_key_fallback.result}"
+  )
+  effective_internal_identity_secret = (
+    var.internal_identity_secret != ""
+    ? var.internal_identity_secret
+    : random_password.internal_identity_secret_fallback.result
   )
   fallback_public_key_sha256 = sha256(tls_private_key.ephemeral_fallback.public_key_pem)
 }
@@ -71,11 +81,16 @@ resource "null_resource" "load_images" {
   depends_on = [kind_cluster.this]
 
   triggers = {
-    cluster_id    = kind_cluster.this.id
-    gateway_image = "${var.gateway_image_repository}:${var.gateway_image_tag}"
-    mock_image    = "${var.mock_llm_image_repository}:${var.mock_llm_image_tag}"
-    litellm_image = var.litellm_image
-    redis_image   = var.redis_image
+    cluster_id           = kind_cluster.this.id
+    gateway_image        = "${var.gateway_image_repository}:${var.gateway_image_tag}"
+    mock_image           = "${var.mock_llm_image_repository}:${var.mock_llm_image_tag}"
+    mcp_runtime_image    = "${var.mcp_runtime_image_repository}:${var.mcp_runtime_image_tag}"
+    litellm_image        = var.litellm_image
+    redis_image          = var.redis_image
+    enable_observability = tostring(var.enable_observability)
+    prometheus_image     = var.prometheus_image
+    grafana_image        = var.grafana_image
+    jaeger_image         = var.jaeger_image
   }
 
   provisioner "local-exec" {
@@ -105,8 +120,14 @@ resource "null_resource" "load_images" {
 
       load_image "${var.gateway_image_repository}:${var.gateway_image_tag}" "true"
       load_image "${var.mock_llm_image_repository}:${var.mock_llm_image_tag}" "true"
+      load_image "${var.mcp_runtime_image_repository}:${var.mcp_runtime_image_tag}" "true"
       load_image "${var.litellm_image}" "false"
       load_image "${var.redis_image}" "false"
+      if [ "${var.enable_observability}" = "true" ]; then
+        load_image "${var.prometheus_image}" "false"
+        load_image "${var.grafana_image}" "false"
+        load_image "${var.jaeger_image}" "false"
+      fi
     EOT
   }
 }
@@ -305,9 +326,21 @@ resource "kubernetes_secret_v1" "gateway_credentials" {
   }
 
   data = {
-    "api-keys.json"      = local.effective_api_keys_json
-    "jwks.json"          = local.effective_jwks_json
-    "litellm-master-key" = local.effective_litellm_master_key
+    "api-keys.json"            = local.effective_api_keys_json
+    "jwks.json"                = local.effective_jwks_json
+    "litellm-master-key"       = local.effective_litellm_master_key
+    "internal-identity-secret" = local.effective_internal_identity_secret
+  }
+}
+
+resource "kubernetes_secret_v1" "mcp_credentials" {
+  metadata {
+    name      = "ai-gateway-mcp-credentials"
+    namespace = kubernetes_namespace_v1.ai_gateway.metadata[0].name
+  }
+
+  data = {
+    "internal-identity-secret" = local.effective_internal_identity_secret
   }
 }
 
@@ -329,7 +362,20 @@ resource "helm_release" "ai_gateway" {
     helm_release.metrics_server,
     helm_release.traefik,
     kubernetes_secret_v1.gateway_credentials,
+    kubernetes_secret_v1.mcp_credentials,
     kubernetes_secret_v1.router_credentials,
+    kubernetes_namespace_v1.observability,
+    kubernetes_deployment_v1.prometheus,
+    kubernetes_deployment_v1.grafana,
+    kubernetes_deployment_v1.jaeger,
+    kubernetes_service_v1.prometheus,
+    kubernetes_service_v1.grafana,
+    kubernetes_service_v1.jaeger,
+    kubernetes_network_policy_v1.default_deny,
+    kubernetes_network_policy_v1.dns_egress,
+    kubernetes_network_policy_v1.prometheus,
+    kubernetes_network_policy_v1.grafana,
+    kubernetes_network_policy_v1.jaeger,
   ]
 
   name      = "ai-gateway"
@@ -353,6 +399,28 @@ resource "helm_release" "ai_gateway" {
           tag        = var.mock_llm_image_tag
           pullPolicy = "IfNotPresent"
         }
+      }
+      mcpRuntime = {
+        image = {
+          repository = var.mcp_runtime_image_repository
+          tag        = var.mcp_runtime_image_tag
+          pullPolicy = "IfNotPresent"
+        }
+      }
+      observability = {
+        otlpEndpoint = (
+          var.enable_observability
+          ? "http://jaeger.${var.observability_namespace}.svc.cluster.local:4318"
+          : ""
+        )
+        prometheusScrape = var.enable_observability
+      }
+      networkPolicy = {
+        allowObservabilityScrape = var.enable_observability
+        observabilityNamespaceSelector = {
+          "kubernetes.io/metadata.name" = var.observability_namespace
+        }
+        allowOtlpEgress = var.enable_observability
       }
     })
   ]

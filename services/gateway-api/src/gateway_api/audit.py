@@ -2,12 +2,9 @@
 
 from __future__ import annotations
 
-import inspect
-import logging
 import re
 import time
 import uuid
-from collections.abc import Callable
 from typing import Any
 
 from opentelemetry import trace
@@ -19,19 +16,34 @@ from gateway_api.telemetry import (
     annotate_span_from_event,
     extract_trace_context,
 )
-from platform_common import ActorContext, AuditEvent, LoadedPolicyBundle, PolicyBundle
+from platform_common import (
+    ActorContext,
+    AuditEmitter,
+    AuditEvent,
+    AuditSink,
+    LoadedPolicyBundle,
+    PolicyBundle,
+)
+
+__all__ = [
+    "AUDIT_LOGGER_NAME",
+    "AuditEmitter",
+    "AuditMiddleware",
+    "AuditSink",
+    "estimate_cost_usd",
+    "extract_trace_id",
+    "is_governed_path",
+]
 
 AUDIT_LOGGER_NAME = "gateway_api.audit"
 _TRACEPARENT_RE = re.compile(r"^([0-9a-f]{2})-([0-9a-f]{32})-([0-9a-f]{16})-([0-9a-f]{2})$")
 _ALL_ZERO_TRACE_ID = "0" * 32
 _ALL_ZERO_PARENT_ID = "0" * 16
 
-AuditSink = Callable[[AuditEvent], Any] | list[AuditEvent]
-
 
 def is_governed_path(path: str) -> bool:
     """Return True for governed LLM and MCP Control Plane request paths."""
-    return path == "/v1/chat/completions" or path == "/mcp" or path.startswith("/mcp/")
+    return path in ("/v1/chat/completions", "/mcp")
 
 
 def extract_trace_id(headers: list[tuple[bytes, bytes]] | tuple[tuple[bytes, bytes], ...]) -> str:
@@ -71,31 +83,6 @@ def estimate_cost_usd(
     return round(cost, 10)
 
 
-class AuditEmitter:
-    """Structured 1-line JSON logger and optional injectable Audit Event sink."""
-
-    def __init__(
-        self,
-        audit_sink: AuditSink | None = None,
-        *,
-        logger_name: str = AUDIT_LOGGER_NAME,
-    ) -> None:
-        self._audit_sink = audit_sink
-        self._logger = logging.getLogger(logger_name)
-
-    async def emit(self, event: AuditEvent) -> None:
-        """Emit one privacy-safe JSON Audit Event to the audit logger and optional sink."""
-        self._logger.info(event.model_dump_json())
-        if self._audit_sink is None:
-            return
-        if isinstance(self._audit_sink, list):
-            self._audit_sink.append(event)
-            return
-        result = self._audit_sink(event)
-        if inspect.isawaitable(result):
-            await result
-
-
 def _initialize_audit_state(
     state: dict[str, Any],
     headers: list[tuple[bytes, bytes]] | tuple[tuple[bytes, bytes], ...],
@@ -119,6 +106,7 @@ def _initialize_audit_state(
     state.setdefault("policy_denial_reason", None)
     state.setdefault("tool_name", None)
     state.setdefault("run_id", None)
+    state.setdefault("outcome", None)
 
 
 def _resolve_policy_action(state: dict[str, Any], status_code: int) -> str:
@@ -198,6 +186,7 @@ def _build_audit_event(
         ),
         latency_ms=round(max(0.0, latency_ms), 3),
         status_code=status_code,
+        outcome=state.get("outcome"),
     )
 
 
@@ -238,7 +227,7 @@ class AuditMiddleware:
                 status_code = int(message["status"])
             await send(message)
 
-        span_name = "gateway.mcp" if path == "/mcp" or path.startswith("/mcp/") else "gateway.chat"
+        span_name = "gateway.mcp" if path == "/mcp" else "gateway.chat"
         tracer = self.tracer_provider.get_tracer("gateway_api.telemetry")
         parent_ctx = extract_trace_context(headers)
 

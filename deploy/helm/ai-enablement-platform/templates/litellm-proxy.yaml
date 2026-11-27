@@ -11,6 +11,7 @@ metadata:
   annotations:
     checkov.io/skip1: "CKV_K8S_35=LiteLLM Proxy config.yaml uses os.environ/LITELLM_MASTER_KEY and upstream Provider API key env vars per ADR-0001"
     checkov.io/skip2: "CKV_K8S_43=LiteLLM image is pinned by version tag ghcr.io/berriai/litellm:1.84.0"
+    checkov.io/skip3: "CKV_K8S_15=Default IfNotPresent pullPolicy supports offline Kind preloaded images while cloud deployments override to Always"
 spec:
   replicas: {{ .Values.litellmProxy.replicaCount }}
   selector:

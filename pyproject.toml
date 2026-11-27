@@ -5,7 +5,9 @@ description = "Governed LLM Control Plane, stateless Model Router, and guarded M
 requires-python = ">=3.12"
 dependencies = [
     "platform-common",
+    "gateway-sdk",
     "gateway-api",
+    "mcp-runtime",
     "mock-llm",
 ]
 
@@ -27,7 +29,9 @@ exclude = ["services/litellm-proxy"]
 
 [tool.uv.sources]
 platform-common = { workspace = true }
+gateway-sdk = { workspace = true }
 gateway-api = { workspace = true }
+mcp-runtime = { workspace = true }
 mock-llm = { workspace = true }
 
 [tool.ruff]
@@ -38,7 +42,14 @@ line-length = 100
 select = ["E", "F", "I", "UP", "B", "SIM"]
 
 [tool.ruff.lint.isort]
-known-first-party = ["platform_common", "gateway_api", "mock_llm", "scripts"]
+known-first-party = [
+    "platform_common",
+    "gateway_sdk",
+    "gateway_api",
+    "mcp_runtime",
+    "mock_llm",
+    "scripts",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

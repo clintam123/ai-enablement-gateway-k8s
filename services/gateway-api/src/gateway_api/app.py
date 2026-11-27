@@ -14,10 +14,11 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from opentelemetry import trace
 from opentelemetry.trace import TracerProvider
 
-from gateway_api.audit import AuditEmitter, AuditMiddleware, AuditSink
+from gateway_api.audit import AUDIT_LOGGER_NAME, AuditEmitter, AuditMiddleware, AuditSink
 from gateway_api.auth import AuthVerifier, GatewayAuthError, authenticate_and_authorize
 from gateway_api.config import ControlPlaneSettings
 from gateway_api.guardrails import GuardrailDeniedError, evaluate_guardrails
+from gateway_api.mcp_proxy import forward_mcp_request
 from gateway_api.quotas import (
     GatewayQuotaError,
     ensure_redis_ready,
@@ -41,6 +42,8 @@ def create_app(
     *,
     model_router_transport: httpx.AsyncBaseTransport | None = None,
     http_client: httpx.AsyncClient | None = None,
+    mcp_runtime_transport: httpx.AsyncBaseTransport | None = None,
+    mcp_http_client: httpx.AsyncClient | None = None,
     audit_sink: AuditSink | None = None,
     redis_client: Any | None = None,
     tracer_provider: TracerProvider | None = None,
@@ -50,7 +53,7 @@ def create_app(
     resolved_settings = settings or ControlPlaneSettings()
     loaded_policy: LoadedPolicyBundle = load_policy_bundle(resolved_settings.policy_bundle_path)
     auth_verifier = AuthVerifier(resolved_settings)
-    audit_emitter = AuditEmitter(audit_sink)
+    audit_emitter = AuditEmitter(audit_sink, logger_name=AUDIT_LOGGER_NAME)
     resolved_metrics = metrics or ControlPlaneMetrics()
     owns_tracer_provider = False
     if tracer_provider is not None:
@@ -63,12 +66,18 @@ def create_app(
         else:
             resolved_tracer_provider = trace.NoOpTracerProvider()
     owns_http_client = http_client is None
+    owns_mcp_http_client = mcp_http_client is None
     owns_redis_client = False
 
     resolved_http_client = http_client or httpx.AsyncClient(
         base_url=resolved_settings.model_router_base_url.rstrip("/"),
         timeout=httpx.Timeout(resolved_settings.model_router_timeout_seconds),
         transport=model_router_transport,
+    )
+    resolved_mcp_http_client = mcp_http_client or httpx.AsyncClient(
+        base_url=resolved_settings.mcp_runtime_base_url.rstrip("/"),
+        timeout=httpx.Timeout(resolved_settings.mcp_runtime_timeout_seconds),
+        transport=mcp_runtime_transport,
     )
 
     resolved_redis_client = redis_client
@@ -88,6 +97,8 @@ def create_app(
         finally:
             if owns_http_client and not resolved_http_client.is_closed:
                 await resolved_http_client.aclose()
+            if owns_mcp_http_client and not resolved_mcp_http_client.is_closed:
+                await resolved_mcp_http_client.aclose()
             if owns_redis_client and resolved_redis_client is not None:
                 await resolved_redis_client.aclose()
             if owns_tracer_provider:
@@ -107,6 +118,7 @@ def create_app(
     app.state.metrics = resolved_metrics
     app.state.tracer_provider = resolved_tracer_provider
     app.state.http_client = resolved_http_client
+    app.state.mcp_http_client = resolved_mcp_http_client
     app.state.redis_client = resolved_redis_client
 
     app.add_middleware(
@@ -123,6 +135,10 @@ def create_app(
         exc: GatewayAuthError,
     ) -> JSONResponse:
         request.state.policy_action = "deny"
+        if request.url.path == "/mcp":
+            request.state.outcome = (
+                "auth_denied" if exc.status_code == status.HTTP_401_UNAUTHORIZED else "rbac_denied"
+            )
         reason = exc.denial_reason or exc.code
         if reason:
             request.state.triggered_rules = [reason]
@@ -305,5 +321,9 @@ def create_app(
                 timeout_seconds=resolved_settings.redis_socket_timeout_seconds,
             )
         return response
+
+    @app.api_route("/mcp", methods=["POST", "GET", "DELETE"])
+    async def mcp_endpoint(request: Request) -> Response:
+        return await forward_mcp_request(request)
 
     return app

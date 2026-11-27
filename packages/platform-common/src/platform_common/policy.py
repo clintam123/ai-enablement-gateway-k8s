@@ -18,6 +18,9 @@ class PolicyDefaults(BaseModel):
     default_max_tokens_ceiling: int = Field(default=512, ge=1)
     requests_per_minute: int = Field(default=60, ge=1)
     daily_budget_usd: float = Field(default=10.0, ge=0.0)
+    mcp_tool_timeout_seconds: float = Field(default=5.0, gt=0.0)
+    mcp_max_tool_calls_per_run: int = Field(default=5, ge=1)
+    mcp_run_ttl_seconds: int = Field(default=3600, ge=1)
 
 
 class ModelAliasPolicy(BaseModel):
@@ -97,3 +100,28 @@ def load_policy_bundle(path: str | Path) -> LoadedPolicyBundle:
         sha256=sha256_hex,
         source_path=bundle_path,
     )
+
+
+def authorize_mcp_tool(
+    policy: PolicyBundle,
+    *,
+    team: str,
+    role: str,
+    tool_name: str,
+    target_team: str | None = None,
+) -> tuple[bool, str | None]:
+    """Authorize Role- and Team-scoped MCP Tool access and cross-Team queries."""
+    team_policy = policy.teams.get(team)
+    if team_policy is None:
+        return False, "team_not_allowed"
+    allowed_tools = team_policy.mcp_tool_allowlist.get(role, ())
+    if tool_name not in allowed_tools:
+        return False, "mcp_tool_not_allowed"
+    if (
+        tool_name == "check_model_catalog"
+        and role != "admin"
+        and target_team is not None
+        and target_team.strip() != team
+    ):
+        return False, "mcp_cross_team_denied"
+    return True, None

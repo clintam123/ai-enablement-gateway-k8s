@@ -114,6 +114,7 @@ def test_all_workloads_define_hardened_security_rbac_probes_and_resources() -> N
 
     expected_workloads = {
         "ai-gateway-gateway-api",
+        "ai-gateway-mcp-runtime",
         "ai-gateway-litellm-proxy",
         "ai-gateway-mock-llm-primary",
         "ai-gateway-mock-llm-fallback",
@@ -241,6 +242,11 @@ def test_gateway_api_redis_and_mock_provider_contracts() -> None:
     assert (
         gw_envs["GATEWAY_MODEL_ROUTER_BASE_URL"]["value"] == "http://ai-gateway-litellm-proxy:4000"
     )
+    assert gw_envs["GATEWAY_MCP_RUNTIME_BASE_URL"]["value"] == "http://ai-gateway-mcp-runtime:8002"
+    assert gw_envs["GATEWAY_INTERNAL_IDENTITY_SECRET"]["valueFrom"]["secretKeyRef"] == {
+        "name": "ai-gateway-credentials",
+        "key": "internal-identity-secret",
+    }
     assert gw_envs["GATEWAY_POLICY_BUNDLE_PATH"]["value"] == "/etc/gateway/policy-bundle.yaml"
     assert gw_envs["GATEWAY_API_KEYS_PATH"]["value"] == "/etc/gateway/secrets/api-keys.json"
     assert gw_envs["GATEWAY_JWT_JWKS_JSON"]["valueFrom"]["secretKeyRef"]["key"] == "jwks.json"
@@ -302,6 +308,71 @@ def test_gateway_api_redis_and_mock_provider_contracts() -> None:
     assert services["ai-gateway-litellm-proxy"]["spec"]["ports"][0]["port"] == 4000
     assert "ai-gateway-redis" in services
     assert services["ai-gateway-redis"]["spec"]["ports"][0]["port"] == 6379
+    assert "ai-gateway-mcp-runtime" in services
+    assert services["ai-gateway-mcp-runtime"]["spec"]["type"] == "ClusterIP"
+    assert services["ai-gateway-mcp-runtime"]["spec"]["ports"][0]["port"] == 8002
+
+
+def test_mcp_runtime_hardened_deployment_and_zero_ingress_contract() -> None:
+    docs = _render_helm_manifests()
+    mcp = _by_kind_and_name(docs, "Deployment")["ai-gateway-mcp-runtime"]
+    ingresses = _by_kind_and_name(docs, "Ingress")
+
+    assert "ai-gateway-mcp-runtime" not in ingresses
+    for ingress in ingresses.values():
+        for rule in ingress["spec"]["rules"]:
+            for path_entry in rule["http"]["paths"]:
+                backend = path_entry["backend"]["service"]
+                assert backend["name"] != "ai-gateway-mcp-runtime"
+                assert backend["port"]["number"] != 8002
+
+    mcp_pod = mcp["spec"]["template"]["spec"]
+    mcp_container = mcp_pod["containers"][0]
+    assert mcp_container["image"] == "ai-mcp-runtime:dev"
+    assert mcp_container["securityContext"]["runAsUser"] == 10001
+    assert mcp_container["ports"][0]["containerPort"] == 8002
+    assert mcp_container["livenessProbe"]["httpGet"]["path"] == "/healthz"
+    assert mcp_container["readinessProbe"]["httpGet"]["path"] == "/readyz"
+
+    mcp_envs = _env_map(mcp_container)
+    assert mcp_envs["HOME"]["value"] == "/tmp"
+    assert mcp_envs["MCP_RUNTIME_POLICY_BUNDLE_PATH"]["value"] == "/etc/mcp/policy-bundle.yaml"
+    assert mcp_envs["MCP_RUNTIME_REDIS_URL"]["value"] == "redis://ai-gateway-redis:6379/0"
+    assert mcp_envs["MCP_RUNTIME_REQUIRE_REDIS"]["value"] == "true"
+    assert mcp_envs["MCP_RUNTIME_TOOL_TIMEOUT_SECONDS"]["value"] in ("5", "5.0")
+    assert mcp_envs["MCP_RUNTIME_MAX_TOOL_CALLS_PER_RUN"]["value"] == "5"
+    assert mcp_envs["MCP_RUNTIME_RUN_TTL_SECONDS"]["value"] == "3600"
+    assert mcp_envs["MCP_RUNTIME_INTERNAL_IDENTITY_SECRET"]["valueFrom"]["secretKeyRef"] == {
+        "name": "ai-gateway-mcp-credentials",
+        "key": "internal-identity-secret",
+    }
+    assert "OTEL_EXPORTER_OTLP_ENDPOINT" not in mcp_envs
+
+    mcp_mounts = _mount_map(mcp_container)
+    mcp_volumes = _volume_map(mcp_pod)
+    assert mcp_mounts["/etc/mcp/policy-bundle.yaml"]["readOnly"] is True
+    assert mcp_mounts["/etc/mcp/policy-bundle.yaml"]["subPath"] == "policy-bundle.yaml"
+    assert "configMap" in mcp_volumes[mcp_mounts["/etc/mcp/policy-bundle.yaml"]["name"]]
+    assert "emptyDir" in mcp_volumes[mcp_mounts["/tmp"]["name"]]
+
+    mcp_checksum = mcp["spec"]["template"]["metadata"]["annotations"]["checksum/policy-bundle"]
+    assert mcp_checksum
+    updated_docs = _render_helm_manifests(
+        "--set-string",
+        "configMaps.policyBundleOverride=schema_version: v1\n",
+        "--set",
+        "observability.otlpEndpoint=http://jaeger.observability.svc.cluster.local:4318",
+    )
+    updated_mcp = _by_kind_and_name(updated_docs, "Deployment")["ai-gateway-mcp-runtime"]
+    assert (
+        updated_mcp["spec"]["template"]["metadata"]["annotations"]["checksum/policy-bundle"]
+        != mcp_checksum
+    )
+    updated_envs = _env_map(updated_mcp["spec"]["template"]["spec"]["containers"][0])
+    assert (
+        updated_envs["OTEL_EXPORTER_OTLP_ENDPOINT"]["value"]
+        == "http://jaeger.observability.svc.cluster.local:4318"
+    )
 
 
 def test_hpa_targets_gateway_api_with_two_plus_max_replicas() -> None:
@@ -395,6 +466,7 @@ def test_zero_trust_network_policies_enforce_isolation_boundaries() -> None:
         "ai-gateway-default-deny",
         "ai-gateway-dns-egress",
         "ai-gateway-gateway-api",
+        "ai-gateway-mcp-runtime",
         "ai-gateway-litellm-proxy",
         "ai-gateway-mock-llm-primary",
         "ai-gateway-mock-llm-fallback",
@@ -407,12 +479,12 @@ def test_zero_trust_network_policies_enforce_isolation_boundaries() -> None:
     assert default_deny["spec"]["podSelector"] == {}
     assert default_deny["spec"]["policyTypes"] == ["Ingress", "Egress"]
 
-    # DNS egress allows UDP + TCP 53 to kube-system for gateway-api and litellm-proxy
+    # DNS egress allows UDP + TCP 53 to kube-system for gateway-api, litellm-proxy, and mcp-runtime
     dns = netpols["ai-gateway-dns-egress"]
     assert dns["spec"]["policyTypes"] == ["Egress"]
     dns_expr = dns["spec"]["podSelector"]["matchExpressions"][0]
     assert dns_expr["key"] == "app.kubernetes.io/component"
-    assert set(dns_expr["values"]) == {"gateway-api", "litellm-proxy"}
+    assert set(dns_expr["values"]) == {"gateway-api", "litellm-proxy", "mcp-runtime"}
     dns_ports = {(p["protocol"], p["port"]) for p in dns["spec"]["egress"][0]["ports"]}
     assert dns_ports == {("UDP", 53), ("TCP", 53)}
     assert (
@@ -442,7 +514,7 @@ def test_zero_trust_network_policies_enforce_isolation_boundaries() -> None:
         for peer in gw_egress_peers
         if "podSelector" in peer
     }
-    assert gw_egress_components == {"litellm-proxy", "redis"}
+    assert gw_egress_components == {"litellm-proxy", "mcp-runtime", "redis"}
     assert "mock-llm-primary" not in gw_egress_components
     assert "mock-llm-fallback" not in gw_egress_components
     assert not any("ipBlock" in peer for peer in gw_egress_peers)
@@ -482,17 +554,60 @@ def test_zero_trust_network_policies_enforce_isolation_boundaries() -> None:
         }
         assert mock_np["spec"].get("egress", []) == []
 
-    # redis: ingress ONLY from gateway-api:6379; zero egress
+    # redis: ingress ONLY from gateway-api and mcp-runtime on 6379; zero egress
     redis_np = netpols["ai-gateway-redis"]
     redis_from = {
         peer["podSelector"]["matchLabels"]["app.kubernetes.io/component"]
         for peer in _flatten_policy_peers(redis_np["spec"]["ingress"], "from")
     }
-    assert redis_from == {"gateway-api"}
+    assert redis_from == {"gateway-api", "mcp-runtime"}
     assert {(p["protocol"], p["port"]) for p in redis_np["spec"]["ingress"][0]["ports"]} == {
         ("TCP", 6379)
     }
     assert redis_np["spec"].get("egress", []) == []
+
+    # mcp-runtime: ingress ONLY from gateway-api:8002;
+    # default egress ONLY to redis:6379; zero external/router/mock egress
+    mcp_np = netpols["ai-gateway-mcp-runtime"]
+    mcp_from = {
+        peer["podSelector"]["matchLabels"]["app.kubernetes.io/component"]
+        for peer in _flatten_policy_peers(mcp_np["spec"]["ingress"], "from")
+    }
+    assert mcp_from == {"gateway-api"}
+    assert {(p["protocol"], p["port"]) for p in mcp_np["spec"]["ingress"][0]["ports"]} == {
+        ("TCP", 8002)
+    }
+    mcp_egress_peers = _flatten_policy_peers(mcp_np["spec"]["egress"], "to")
+    mcp_to_components = {
+        peer["podSelector"]["matchLabels"]["app.kubernetes.io/component"]
+        for peer in mcp_egress_peers
+        if "podSelector" in peer
+    }
+    assert mcp_to_components == {"redis"}
+    assert {(p["protocol"], p["port"]) for p in mcp_np["spec"]["egress"][0]["ports"]} == {
+        ("TCP", 6379)
+    }
+    assert not any("ipBlock" in peer for peer in mcp_egress_peers)
+
+    # Optional OTLP egress grants mcp-runtime 4317/4318 to observability namespace
+    otlp_docs = _render_helm_manifests("--set", "networkPolicy.allowOtlpEgress=true")
+    otlp_mcp_np = _by_kind_and_name(otlp_docs, "NetworkPolicy")["ai-gateway-mcp-runtime"]
+    otlp_rules = [
+        rule
+        for rule in otlp_mcp_np["spec"]["egress"]
+        if any(
+            peer.get("namespaceSelector", {})
+            .get("matchLabels", {})
+            .get("kubernetes.io/metadata.name")
+            == "observability"
+            for peer in rule.get("to") or []
+        )
+    ]
+    assert len(otlp_rules) == 1
+    assert {(p["protocol"], p["port"]) for p in otlp_rules[0]["ports"]} == {
+        ("TCP", 4317),
+        ("TCP", 4318),
+    }
 
     # Optional external Provider egress on litellm-proxy blocks RFC1918 + link-local metadata
     ext_docs = _render_helm_manifests("--set", "networkPolicy.allowExternalProviderEgress=true")

@@ -58,6 +58,18 @@ variable "mock_llm_image_tag" {
   default     = "dev"
 }
 
+variable "mcp_runtime_image_repository" {
+  description = "Local Docker image repository for the Guarded MCP Runtime (mcp-runtime)."
+  type        = string
+  default     = "ai-mcp-runtime"
+}
+
+variable "mcp_runtime_image_tag" {
+  description = "Local Docker image tag for the Guarded MCP Runtime (mcp-runtime)."
+  type        = string
+  default     = "dev"
+}
+
 variable "litellm_image" {
   description = "Pinned Model Router (LiteLLM Proxy) image pre-loaded into Kind when cached locally."
   type        = string
@@ -89,4 +101,41 @@ variable "litellm_master_key" {
   type        = string
   default     = ""
   sensitive   = true
+}
+
+variable "internal_identity_secret" {
+  description = "HS256 signing secret (>=32 bytes) shared between gateway-api and mcp-runtime Secrets."
+  type        = string
+  default     = ""
+  sensitive   = true
+}
+
+variable "enable_observability" {
+  description = "Deploy lightweight single-pod Prometheus, Grafana, and Jaeger OTLP observability stack."
+  type        = bool
+  default     = true
+}
+
+variable "observability_namespace" {
+  description = "Kubernetes namespace for Prometheus, Grafana, and Jaeger workloads."
+  type        = string
+  default     = "observability"
+}
+
+variable "prometheus_image" {
+  description = "Pinned Prometheus container image."
+  type        = string
+  default     = "prom/prometheus:v3.2.1"
+}
+
+variable "grafana_image" {
+  description = "Pinned Grafana container image."
+  type        = string
+  default     = "grafana/grafana:11.5.2"
+}
+
+variable "jaeger_image" {
+  description = "Pinned Jaeger v2 all-in-one OTLP container image."
+  type        = string
+  default     = "cr.jaegertracing.io/jaegertracing/jaeger:2.23.0"
 }

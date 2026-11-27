@@ -1,0 +1,45 @@
+# Engineering Postmortem & Architectural Trade-offs
+
+Retrospective covering the architectural trade-offs codified in [`docs/adr/`](./adr/), real operational issues encountered and fixed across `v0.1` and `v0.2`, and how this single-cluster architecture evolves to multi-region production.
+
+## 1. Architectural Trade-Offs (ADR-0001 through ADR-0006)
+
+- **ADR-0001 — Hybrid Control Plane + Stateless LiteLLM Proxy:** Splitting governance (`gateway-api`) from **Provider** translation (`litellm-proxy` in YAML-only mode with zero Postgres) avoided paid LiteLLM Enterprise licensing for JWT authentication and kept **Policy Bundles** in immutable GitOps YAML. Trade-off: an extra internal HTTP hop (`3.387 ms` p50 / `5.625 ms` p95 **Control Plane** overhead in live benchmarks) and dependence on LiteLLM response headers (`x-litellm-attempted-fallbacks`, `x-litellm-model-id`) plus `always_include_stream_usage: true`.
+- **ADR-0002 — Gateway-Mediated MCP Runtime with Signed Assertions:** Routing `/mcp` exclusively through `gateway-api` eliminates external Ingress on **MCP Runtime** (`mcp-runtime`) while minting short-lived HS256 identity assertions (`actor_id`, `team`, `role`, `run_id`, `trace_id`). Even if `NetworkPolicy` were bypassed, `mcp-runtime` rejects unsigned requests, enforces per-call timeouts, and halts runaway **Run** loops server-side in Redis.
+- **ADR-0003 — Atomic Reserve-Then-Reconcile Quotas & Fail-Closed Redis:** Pre-reserving worst-case **LLM Token** cost via atomic Redis Lua scripts prevents concurrent request bursts and long SSE streams from overshooting **Team** **Budget Quotas** across HPA replicas, and failing closed (`503`) guarantees governance is never silently bypassed. Trade-off: Redis becomes a hard availability dependency requiring strict disconnection/cancellation cleanup (`anyio.CancelScope(shield=True)`) so aborted streams refund unused reservations.
+- **ADR-0004 — Calico CNI on Local Kind:** Default `kindnet` accepts `NetworkPolicy` YAML without enforcing L3/L4 isolation. Replacing it with Calico adds ~`60s` to `make up` bootstrap, but enables automated negative probes in [`scripts/smoke_test.py`](../scripts/smoke_test.py) proving `gateway-api -> mock-llm-primary:8000` and `mcp-runtime -> 1.1.1.1:443` actually fail at the network layer.
+- **ADR-0005 — Ephemeral GCP GKE Autopilot vs. AWS EKS:** Standardizing cloud Terraform on [`terraform/gcp/`](../terraform/gcp/) instead of unverified EKS HCL allowed real `terraform validate`, `checkov`, and low-cost ephemeral `apply -> smoke -> destroy` verification under a `$10/month` budget with Workload Identity and optional Gemini **Provider** wiring.
+- **ADR-0006 — Traefik Ingress over Archived Ingress-NGINX:** Community `kubernetes/ingress-nginx` reached EOL and was archived in March 2026. Traefik provides an actively maintained single-pod `Ingress` controller with clean namespace selectors (`traefik`), though multi-protocol routing long-term should migrate to Kubernetes Gateway API (`HTTPRoute`).
+
+## 2. Real Issues Encountered & Fixed During Implementation
+
+### Incident A — LiteLLM `1.84.0` OOMKill at `1Gi` (`1.039 GiB` Startup RSS)
+- **Symptom:** Under initial Helm resource bounds (`limits.memory: 512Mi`, then `1Gi`), `ghcr.io/berriai/litellm:1.84.0` hit `OOMKilled` (`1.039 GiB` RSS during FastAPI/Prisma/tiktoken worker initialization) and failed default liveness probes before completing startup.
+- **Root Cause:** LiteLLM Proxy preloads model cost maps and spawns multiple workers by default, pushing baseline RSS past `1Gi` while also attempting remote cost-map fetches or writes on read-only filesystems.
+- **Fix:** Pinned `--num_workers 1` and `LITELLM_LOCAL_MODEL_COST_MAP=True`, redirected cache/migration directories (`HOME`, `XDG_CACHE_HOME`, `LITELLM_MIGRATION_DIR`, `PRISMA_BINARY_CACHE_DIR`, `TIKTOKEN_CACHE_DIR`) to `/tmp` `emptyDir`, added a `startupProbe` (`failureThreshold: 24`, `5s` period), and raised `litellmProxy.resources` to `requests.memory: 1Gi` / `limits.memory: 1536Mi` in [`deploy/helm/ai-enablement-platform/values.yaml`](../deploy/helm/ai-enablement-platform/values.yaml).
+
+### Incident B — FastMCP Streamable HTTP Lifespan & `421 Misdirected Request`
+- **Symptom:** When mounting `mcp.streamable_http_app()` inside `mcp-runtime`'s FastAPI app behind Kubernetes ClusterIP (`ai-gateway-mcp-runtime:8002`), Streamable HTTP requests either failed with uninitialized task-group errors or returned `421 Misdirected Request`.
+- **Root Cause:** Starlette/FastAPI does not run mounted sub-application lifespans automatically, leaving `mcp.session_manager` unstarted; additionally, FastMCP's default DNS-rebinding middleware rejected non-`localhost` `Host` headers inside the cluster.
+- **Fix:** Entered `async with mcp.session_manager.run():` inside `mcp-runtime`'s outer FastAPI `lifespan`, configured `TransportSecuritySettings(enable_dns_rebinding_protection=False)` in [`services/mcp-runtime/src/mcp_runtime/tools.py`](../services/mcp-runtime/src/mcp_runtime/tools.py), and registered `/healthz` + `/readyz` before mounting `mcp_asgi_app` at `/` with `streamable_http_path="/mcp"` (avoiding `307` trailing-slash redirects).
+
+### Incident C — Least-Privilege Prometheus Discovery Without ClusterRole RBAC
+- **Symptom:** Standard Prometheus `kubernetes_sd_configs` requires a `ClusterRole` (`list`/`watch` pods and endpoints across namespaces) and mounted Kubernetes API tokens, violating the platform's zero-RBAC hardening (`automountServiceAccountToken: false`).
+- **Fix:** Added a headless Service (`ai-gateway-gateway-api-headless`, `clusterIP: None`) in [`deploy/helm/ai-enablement-platform/templates/gateway-api.yaml`](../deploy/helm/ai-enablement-platform/templates/gateway-api.yaml) and configured Prometheus `dns_sd_configs` (`type: A`, `port: 8000`) in [`deploy/observability/prometheus/prometheus.yml`](../deploy/observability/prometheus/prometheus.yml). Prometheus scraped all `4` HPA-scaled `gateway-api` replicas dynamically with zero Kubernetes API permissions.
+
+### Incident D — Trivy `libzstd1` `CVE-2026-124851` Gate Failure
+- **Symptom:** Blocking Trivy image scanning (`--ignore-unfixed --severity CRITICAL,HIGH --exit-code 1`) flagged fixable Debian base-image `libzstd1` vulnerability `CVE-2026-124851` in `python:3.12-slim`.
+- **Fix:** Added `apt-get update && apt-get upgrade -y --no-install-recommends && rm -rf /var/lib/apt/lists/*` to all three custom service `Dockerfile`s (`gateway-api`, `mcp-runtime`, `mock-llm`) while keeping the pinned `ghcr.io/berriai/litellm:1.84.0` image scanned via non-blocking SARIF artifact upload in [`.github/workflows/ci.yml`](../.github/workflows/ci.yml).
+
+### Incident E — Ticket `#14` Live Load & Failover Observations
+- **RPM vs. HPA coupling:** Default `platform-eng` `requests_per_minute: 120` caused `gateway-api` to shed load with `429` before reaching `50%` of `100m` CPU. [`scripts/run_benchmarks.py`](../scripts/run_benchmarks.py) resolves this cleanly via a scoped temporary Helm `policyBundleOverride` during `budget_quota_exhaustion` & `hpa_sustained` with guaranteed `finally:` restoration.
+- **Cold-scale spike behavior (`99.997%` success):** During the `339.934` RPS `hpa_sustained` burst (`30595` requests) before HPA scaled `1 -> 4` Ready pods, single-replica `gateway-api` peaked at `489%` CPU and single-worker `litellm-proxy` queued requests, with `max = 564.176 ms` latency and `1` transient burst error (`0.999967` success rate). Scaling `litellm-proxy` replicas alongside `gateway-api` or setting `minReplicas: 2` eliminates cold-scale contention under sudden spikes.
+- **Failover retry latency (`4743.036 ms` p50):** `litellm_settings.num_retries: 2` performs two Provider attempts with backoff against `mock-llm-primary` before switching to `mock-llm-fallback`. Lowering `num_retries` to `1` or tuning `timeout` cuts failover latency when fast fallback is preferred over primary retries.
+
+## 3. Production & Multi-Region Evolution
+
+To evolve from this single-cluster portfolio baseline to multi-region production:
+1. **Multi-region active-active ingress & routing:** Place global Anycast / Cloud Load Balancing in front of regional **Control Plane** + **Model Router** stacks, using regional **Provider** endpoints with cross-region failover.
+2. **Distributed Budget Quota state:** Replace single-pod Redis with clustered Redis (or Redis Enterprise / regional Memorystore with async cross-region spend reconciliation and local burst budgets) plus PodDisruptionBudgets and `minReplicas >= 2`.
+3. **Secret management & identity:** Sync **Provider** API keys and HMAC signing keys from GCP Secret Manager or HashiCorp Vault via External Secrets Operator, and point `GATEWAY_JWT_JWKS_URL` at a production OIDC identity **Provider** instead of static JWKS JSON.
+4. **Full observability & Gateway API:** Replace single-pod Prometheus/Grafana/Jaeger with `kube-prometheus-stack`, Prometheus Alertmanager PagerDuty/Slack receivers, persistent Tempo/Jaeger storage, and Kubernetes Gateway API (`Gateway` + `HTTPRoute`) per ADR-0006.
