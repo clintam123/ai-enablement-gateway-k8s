@@ -206,6 +206,10 @@ def annotate_span_from_event(
         span.set_attribute("gateway.requested_model", event.requested_model)
     if event.routed_model:
         span.set_attribute("gateway.routed_model", event.routed_model)
+    if event.tool_name:
+        span.set_attribute("gateway.tool_name", event.tool_name)
+    if event.run_id:
+        span.set_attribute("gateway.run_id", event.run_id)
     if had_exception:
         return
     if event.status_code >= 500:
