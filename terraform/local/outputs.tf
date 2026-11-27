@@ -22,3 +22,13 @@ output "traefik_namespace" {
   description = "Kubernetes namespace hosting the Traefik Ingress controller."
   value       = kubernetes_namespace_v1.traefik.metadata[0].name
 }
+
+output "observability_enabled" {
+  description = "Whether the lightweight observability stack is deployed."
+  value       = var.enable_observability
+}
+
+output "observability_namespace" {
+  description = "Kubernetes namespace hosting Prometheus, Grafana, and Jaeger when enabled."
+  value       = var.enable_observability ? kubernetes_namespace_v1.observability[0].metadata[0].name : ""
+}

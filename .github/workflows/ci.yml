@@ -94,7 +94,7 @@ jobs:
           kind version
 
       - name: Provision Kind + Calico + Traefik + AI Gateway
-        run: make up
+        run: make up ENABLE_OBSERVABILITY=false
 
       - name: Run live smoke suite
         run: make smoke

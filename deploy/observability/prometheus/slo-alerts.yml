@@ -1,0 +1,67 @@
+groups:
+  - name: ai-enablement-gateway-slo
+    rules:
+      - alert: GatewayHighP95Overhead
+        expr: >-
+          histogram_quantile(
+            0.95,
+            sum by (le, route) (rate(gateway_overhead_duration_seconds_bucket[5m]))
+          ) > 0.05
+        for: 2m
+        labels:
+          severity: warning
+          component: control-plane
+        annotations:
+          summary: "Control Plane p95 overhead latency exceeds 50ms on {{ $labels.route }}"
+          description: >-
+            Control Plane processing overhead (excluding Model Router upstream wait)
+            exceeded 50ms p95 over 5m for route {{ $labels.route }}.
+
+      - alert: GatewayHigh5xxErrorRate
+        expr: >-
+          (
+            sum(rate(gateway_requests_total{status=~"5.."}[5m]))
+            / clamp_min(sum(rate(gateway_requests_total[5m])), 1e-9)
+          ) > 0.05
+          and sum(rate(gateway_requests_total[5m])) > 0
+        for: 2m
+        labels:
+          severity: critical
+          component: control-plane
+        annotations:
+          summary: "Control Plane 5xx error rate exceeds 5%"
+          description: >-
+            Governed Control Plane 5xx responses exceeded 5% of total request volume
+            over the last 5m.
+
+      - alert: GatewayHighUpstreamFailoverRate
+        expr: >-
+          (
+            sum(rate(gateway_upstream_failovers_total[5m]))
+            / clamp_min(sum(rate(gateway_requests_total{route="/v1/chat/completions"}[5m])), 1e-9)
+          ) > 0.05
+          and sum(rate(gateway_requests_total{route="/v1/chat/completions"}[5m])) > 0
+        for: 2m
+        labels:
+          severity: warning
+          component: model-router
+        annotations:
+          summary: "Model Router primary-to-fallback failover rate exceeds 5%"
+          description: >-
+            More than 5% of /v1/chat/completions requests failed over to a fallback
+            Provider over the last 5m.
+
+      - alert: GatewayTeamBudgetQuotaExhaustion
+        expr: >-
+          sum by (team) (
+            increase(gateway_policy_denials_total{reason="budget_quota_exceeded"}[5m])
+          ) > 0
+        for: 1m
+        labels:
+          severity: warning
+          component: budget-quota
+        annotations:
+          summary: "Team {{ $labels.team }} exhausted daily Budget Quota"
+          description: >-
+            Control Plane denied requests with 429 budget_quota_exceeded for Team
+            {{ $labels.team }} in the last 5m.

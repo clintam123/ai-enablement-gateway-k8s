@@ -1,4 +1,5 @@
 CLUSTER_NAME ?= ai-enablement-gateway
+ENABLE_OBSERVABILITY ?= true
 LOCAL_DIR := $(CURDIR)/.local
 TF_DIR := terraform/local
 CHART_DIR := deploy/helm/ai-enablement-platform
@@ -15,7 +16,7 @@ build-images:
 up: build-images
 	@if [ ! -f "$(LOCAL_DIR)/local.tfvars.json" ]; then $(MAKE) dev-creds; fi
 	terraform -chdir=$(TF_DIR) init -input=false
-	terraform -chdir=$(TF_DIR) apply -auto-approve -input=false -var="cluster_name=$(CLUSTER_NAME)" -var-file="$(LOCAL_DIR)/local.tfvars.json"
+	terraform -chdir=$(TF_DIR) apply -auto-approve -input=false -var="cluster_name=$(CLUSTER_NAME)" -var="enable_observability=$(ENABLE_OBSERVABILITY)" -var-file="$(LOCAL_DIR)/local.tfvars.json"
 
 down:
 	@if [ -f "$(TF_DIR)/terraform.tfstate" ]; then \
