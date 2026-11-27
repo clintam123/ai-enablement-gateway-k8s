@@ -1,5 +1,15 @@
 """Shared canonical domain schemas and Policy Bundle loader."""
 
+from platform_common.internal_auth import (
+    INTERNAL_IDENTITY_AUDIENCE,
+    INTERNAL_IDENTITY_HEADER,
+    INTERNAL_IDENTITY_ISSUER,
+    MIN_INTERNAL_IDENTITY_SECRET_BYTES,
+    InternalIdentityAssertion,
+    InternalIdentityError,
+    sign_internal_identity_assertion,
+    verify_internal_identity_assertion,
+)
 from platform_common.models import (
     ActorContext,
     AuditEvent,
@@ -36,8 +46,14 @@ __all__ = [
     "ChatCompletionRequest",
     "ChatCompletionResponse",
     "ChatMessage",
+    "INTERNAL_IDENTITY_AUDIENCE",
+    "INTERNAL_IDENTITY_HEADER",
+    "INTERNAL_IDENTITY_ISSUER",
+    "InternalIdentityAssertion",
+    "InternalIdentityError",
     "LLMTokenUsage",
     "LoadedPolicyBundle",
+    "MIN_INTERNAL_IDENTITY_SECRET_BYTES",
     "ModelAliasPolicy",
     "OpenAIErrorDetail",
     "OpenAIErrorPayload",
@@ -48,4 +64,6 @@ __all__ = [
     "TeamPolicy",
     "build_openai_error",
     "load_policy_bundle",
+    "sign_internal_identity_assertion",
+    "verify_internal_identity_assertion",
 ]

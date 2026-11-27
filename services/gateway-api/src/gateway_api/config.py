@@ -19,6 +19,12 @@ class ControlPlaneSettings(BaseSettings):
     model_router_timeout_seconds: float = 30.0
     mock_mode_enabled: bool = True
 
+    # Guarded MCP Runtime proxy & internal identity settings
+    mcp_runtime_base_url: str = "http://localhost:8002"
+    mcp_runtime_timeout_seconds: float = 30.0
+    internal_identity_secret: str | None = None
+    internal_identity_ttl_seconds: int = 30
+
     # Credential authentication settings
     api_keys_path: Path | None = None
     api_keys_json: str | None = None

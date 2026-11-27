@@ -18,6 +18,9 @@ class PolicyDefaults(BaseModel):
     default_max_tokens_ceiling: int = Field(default=512, ge=1)
     requests_per_minute: int = Field(default=60, ge=1)
     daily_budget_usd: float = Field(default=10.0, ge=0.0)
+    mcp_tool_timeout_seconds: float = Field(default=5.0, gt=0.0)
+    mcp_max_tool_calls_per_run: int = Field(default=5, ge=1)
+    mcp_run_ttl_seconds: int = Field(default=3600, ge=1)
 
 
 class ModelAliasPolicy(BaseModel):

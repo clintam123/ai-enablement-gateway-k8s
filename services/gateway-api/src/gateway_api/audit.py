@@ -119,6 +119,7 @@ def _initialize_audit_state(
     state.setdefault("policy_denial_reason", None)
     state.setdefault("tool_name", None)
     state.setdefault("run_id", None)
+    state.setdefault("outcome", None)
 
 
 def _resolve_policy_action(state: dict[str, Any], status_code: int) -> str:
@@ -198,6 +199,7 @@ def _build_audit_event(
         ),
         latency_ms=round(max(0.0, latency_ms), 3),
         status_code=status_code,
+        outcome=state.get("outcome"),
     )
 
 
