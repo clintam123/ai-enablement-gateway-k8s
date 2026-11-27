@@ -143,12 +143,12 @@ def _load_credentials(credentials_path: Path) -> dict[str, Any]:
 
 def _fresh_rs256_jwt(bundle: dict[str, Any], team: str) -> str:
     team_info = bundle["teams"][team]
-    token = team_info.get("rs256_jwt")
-    if isinstance(token, str) and token:
+    jwt_credential = team_info.get("rs256_jwt")
+    if isinstance(jwt_credential, str) and jwt_credential:
         try:
-            claims = jwt.decode(token, options={"verify_signature": False})
+            claims = jwt.decode(jwt_credential, options={"verify_signature": False})
             if float(claims.get("exp", 0)) > time.time() + 120:
-                return token
+                return jwt_credential
         except jwt.PyJWTError:
             pass
 
@@ -555,6 +555,7 @@ async def _check_redis_rpm_quota_429(
         "x-ratelimit-limit-requests",
         "x-ratelimit-remaining-requests",
         "x-budget-limit-usd",
+        "x-budget-remaining-usd",
         "x-policy-denial-reason",
     ):
         _require(

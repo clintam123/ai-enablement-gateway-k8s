@@ -100,3 +100,28 @@ def load_policy_bundle(path: str | Path) -> LoadedPolicyBundle:
         sha256=sha256_hex,
         source_path=bundle_path,
     )
+
+
+def authorize_mcp_tool(
+    policy: PolicyBundle,
+    *,
+    team: str,
+    role: str,
+    tool_name: str,
+    target_team: str | None = None,
+) -> tuple[bool, str | None]:
+    """Authorize Role- and Team-scoped MCP Tool access and cross-Team queries."""
+    team_policy = policy.teams.get(team)
+    if team_policy is None:
+        return False, "team_not_allowed"
+    allowed_tools = team_policy.mcp_tool_allowlist.get(role, ())
+    if tool_name not in allowed_tools:
+        return False, "mcp_tool_not_allowed"
+    if (
+        tool_name == "check_model_catalog"
+        and role != "admin"
+        and target_team is not None
+        and target_team.strip() != team
+    ):
+        return False, "mcp_cross_team_denied"
+    return True, None

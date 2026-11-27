@@ -10,7 +10,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.applications import Starlette
 
-from platform_common import InternalIdentityAssertion, LoadedPolicyBundle
+from platform_common import InternalIdentityAssertion, LoadedPolicyBundle, authorize_mcp_tool
 
 ACTOR_ASSERTION_CTX: ContextVar[InternalIdentityAssertion | None] = ContextVar(
     "mcp_runtime_actor_assertion",
@@ -125,14 +125,19 @@ def build_mcp_server(
         await _maybe_delay()
         normalized_team = team.strip()
         assertion = ACTOR_ASSERTION_CTX.get()
-        if (
-            assertion is not None
-            and assertion.role != "admin"
-            and normalized_team != assertion.team
-        ):
-            raise PermissionError(
-                f"Role '{assertion.role}' may not query catalog for Team '{normalized_team}'"
+        if assertion is not None:
+            allowed, denial_reason = authorize_mcp_tool(
+                loaded_policy.bundle,
+                team=assertion.team,
+                role=assertion.role,
+                tool_name="check_model_catalog",
+                target_team=normalized_team,
             )
+            if not allowed:
+                raise PermissionError(
+                    f"Role '{assertion.role}' may not query catalog for Team '{normalized_team}' "
+                    f"({denial_reason})"
+                )
 
         team_policy = loaded_policy.bundle.teams.get(normalized_team)
         if team_policy is None:

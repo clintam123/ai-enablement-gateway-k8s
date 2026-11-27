@@ -32,7 +32,7 @@ def build_model_router_headers(
     request: Request,
     settings: ControlPlaneSettings,
 ) -> dict[str, str]:
-    """Build outbound headers for the Model Router, never forwarding caller Credentials."""
+    """Build outbound headers for the Model Router, never forwarding Actor Credentials."""
     headers: dict[str, str] = {"content-type": "application/json"}
     if settings.model_router_api_key:
         headers["authorization"] = f"Bearer {settings.model_router_api_key}"

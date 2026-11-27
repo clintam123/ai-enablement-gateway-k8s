@@ -1,4 +1,4 @@
-"""Offline HTTP-seam tests for Guarded MCP Runtime and Control Plane /mcp proxy."""
+"""Offline HTTP-seam tests for Guarded MCP Runtime and Control Plane /mcp forwarding."""
 
 from __future__ import annotations
 
@@ -36,7 +36,10 @@ from platform_common import (
     InternalIdentityAssertion,
     InternalIdentityError,
     PolicyDefaults,
+    authorize_mcp_tool,
+    load_policy_bundle,
     sign_internal_identity_assertion,
+    validate_internal_identity_secret,
     verify_internal_identity_assertion,
 )
 from scripts.generate_test_keys import (
@@ -56,7 +59,7 @@ MCP_HEADERS = {
 }
 
 
-def test_internal_identity_sign_verify_and_reject_invalid_tokens() -> None:
+def test_internal_identity_sign_verify_and_reject_invalid_assertions() -> None:
     assert INTERNAL_IDENTITY_HEADER == "x-internal-actor-assertion"
     assert INTERNAL_IDENTITY_ISSUER == "ai-gateway-control-plane"
     assert INTERNAL_IDENTITY_AUDIENCE == "ai-gateway-mcp-runtime"
@@ -69,7 +72,7 @@ def test_internal_identity_sign_verify_and_reject_invalid_tokens() -> None:
         auth_method="jwt",
     )
     now = int(time.time())
-    token = sign_internal_identity_assertion(
+    assertion_jwt = sign_internal_identity_assertion(
         actor=actor,
         run_id="run-slice-1",
         trace_id="4bf92f3577b34da6a3ce929d0e0e4736",
@@ -77,7 +80,7 @@ def test_internal_identity_sign_verify_and_reject_invalid_tokens() -> None:
         ttl_seconds=30,
         now=now,
     )
-    verified = verify_internal_identity_assertion(token, secret=TEST_INTERNAL_SECRET)
+    verified = verify_internal_identity_assertion(assertion_jwt, secret=TEST_INTERNAL_SECRET)
     assert isinstance(verified, InternalIdentityAssertion)
     assert verified.actor_id == "dev-alice"
     assert verified.team == "platform-eng"
@@ -92,7 +95,7 @@ def test_internal_identity_sign_verify_and_reject_invalid_tokens() -> None:
         verify_internal_identity_assertion(None, secret=TEST_INTERNAL_SECRET)
     assert missing_exc.value.code == "missing_assertion"
 
-    expired_token = sign_internal_identity_assertion(
+    expired_assertion = sign_internal_identity_assertion(
         actor=actor,
         run_id="run-expired",
         trace_id="4bf92f3577b34da6a3ce929d0e0e4736",
@@ -101,17 +104,17 @@ def test_internal_identity_sign_verify_and_reject_invalid_tokens() -> None:
         now=now - 60,
     )
     with pytest.raises(InternalIdentityError) as expired_exc:
-        verify_internal_identity_assertion(expired_token, secret=TEST_INTERNAL_SECRET)
+        verify_internal_identity_assertion(expired_assertion, secret=TEST_INTERNAL_SECRET)
     assert expired_exc.value.code == "expired_assertion"
 
     with pytest.raises(InternalIdentityError) as wrong_secret_exc:
         verify_internal_identity_assertion(
-            token,
+            assertion_jwt,
             secret="wrong-internal-mcp-identity-secret-32b",
         )
     assert wrong_secret_exc.value.code == "invalid_assertion"
 
-    alg_none_token = jwt.encode(
+    alg_none_assertion = jwt.encode(
         {
             "iss": INTERNAL_IDENTITY_ISSUER,
             "aud": INTERNAL_IDENTITY_AUDIENCE,
@@ -128,7 +131,7 @@ def test_internal_identity_sign_verify_and_reject_invalid_tokens() -> None:
         algorithm="none",
     )
     with pytest.raises(InternalIdentityError) as alg_none_exc:
-        verify_internal_identity_assertion(alg_none_token, secret=TEST_INTERNAL_SECRET)
+        verify_internal_identity_assertion(alg_none_assertion, secret=TEST_INTERNAL_SECRET)
     assert alg_none_exc.value.code == "invalid_assertion"
 
     with pytest.raises(ValueError):
@@ -140,7 +143,48 @@ def test_internal_identity_sign_verify_and_reject_invalid_tokens() -> None:
         )
 
     with pytest.raises(ValueError):
-        verify_internal_identity_assertion(token, secret="too-short")
+        verify_internal_identity_assertion(assertion_jwt, secret="too-short")
+
+
+def test_validate_internal_identity_secret_and_authorize_mcp_tool() -> None:
+    assert validate_internal_identity_secret(TEST_INTERNAL_SECRET) == TEST_INTERNAL_SECRET
+    for bad_secret in (None, "", "too-short"):
+        with pytest.raises(ValueError):
+            validate_internal_identity_secret(bad_secret)
+
+    policy = load_policy_bundle(POLICY_BUNDLE_PATH).bundle
+    assert authorize_mcp_tool(
+        policy,
+        team="unknown-team",
+        role="developer",
+        tool_name="query_runbook",
+    ) == (False, "team_not_allowed")
+    assert authorize_mcp_tool(
+        policy,
+        team="product-eng",
+        role="developer",
+        tool_name="lookup_service_slo",
+    ) == (False, "mcp_tool_not_allowed")
+    assert authorize_mcp_tool(
+        policy,
+        team="product-eng",
+        role="developer",
+        tool_name="check_model_catalog",
+        target_team="platform-eng",
+    ) == (False, "mcp_cross_team_denied")
+    assert authorize_mcp_tool(
+        policy,
+        team="platform-eng",
+        role="admin",
+        tool_name="check_model_catalog",
+        target_team="product-eng",
+    ) == (True, None)
+    assert authorize_mcp_tool(
+        policy,
+        team="ops-eng",
+        role="ops",
+        tool_name="lookup_service_slo",
+    ) == (True, None)
 
 
 def test_audit_event_outcome_and_policy_defaults_mcp_fields_are_backward_compatible() -> None:
@@ -269,7 +313,7 @@ async def test_mcp_runtime_direct_subseam_rejects_untrusted_assertions(
         audit_sink=events,
     )
 
-    actor = ActorContext(actor_id="ops-user", team="ops-eng", role="ops", auth_method="jwt")
+    actor = ActorContext(actor_id="ops-actor", team="ops-eng", role="ops", auth_method="jwt")
     now = int(time.time())
     valid_assertion = sign_internal_identity_assertion(
         actor=actor,
@@ -299,8 +343,8 @@ async def test_mcp_runtime_direct_subseam_rejects_untrusted_assertions(
         {
             "iss": INTERNAL_IDENTITY_ISSUER,
             "aud": INTERNAL_IDENTITY_AUDIENCE,
-            "sub": "ops-user",
-            "actor_id": "ops-user",
+            "sub": "ops-actor",
+            "actor_id": "ops-actor",
             "team": "ops-eng",
             "role": "admin",
             "run_id": "run-direct-alg-none",
@@ -338,10 +382,10 @@ async def test_mcp_runtime_direct_subseam_rejects_untrusted_assertions(
                 base_url="http://mcp-runtime",
             ) as client,
         ):
-            for _label, assertion_token in bad_assertions:
+            for _label, assertion_jwt in bad_assertions:
                 headers = dict(MCP_HEADERS)
-                if assertion_token is not None:
-                    headers[INTERNAL_IDENTITY_HEADER] = assertion_token
+                if assertion_jwt is not None:
+                    headers[INTERNAL_IDENTITY_HEADER] = assertion_jwt
                 resp = await client.post(
                     "/mcp",
                     json=_jsonrpc_call("tools/list"),
@@ -494,7 +538,9 @@ def _build_gateway_with_mcp(
     return gateway_app, recorder
 
 
-async def test_control_plane_mcp_proxy_rejects_unauthenticated_and_invalid_credentials() -> None:
+async def test_control_plane_mcp_forwarding_rejects_unauthenticated_and_invalid_credentials() -> (
+    None
+):
     keypair = generate_rsa_keypair(seed="mcp-auth-test")
     mcp_events: list[AuditEvent] = []
     gateway_events: list[AuditEvent] = []
@@ -552,9 +598,11 @@ async def test_control_plane_mcp_proxy_rejects_unauthenticated_and_invalid_crede
     assert gateway_events[0].run_id is not None and gateway_events[0].run_id.startswith("run-")
 
 
-async def test_control_plane_mcp_proxy_fails_closed_when_internal_secret_unconfigured() -> None:
+async def test_control_plane_mcp_forwarding_fails_closed_when_internal_secret_unconfigured() -> (
+    None
+):
     keypair = generate_rsa_keypair(seed="mcp-secret-test")
-    token = mint_rs256_jwt(
+    jwt_credential = mint_rs256_jwt(
         private_pem=keypair.private_pem,
         kid=keypair.kid,
         actor_id="ops-bob",
@@ -588,7 +636,7 @@ async def test_control_plane_mcp_proxy_fails_closed_when_internal_secret_unconfi
             resp = await client.post(
                 "/mcp",
                 json=_jsonrpc_call("tools/list"),
-                headers={**MCP_HEADERS, "Authorization": f"Bearer {token}"},
+                headers={**MCP_HEADERS, "Authorization": f"Bearer {jwt_credential}"},
             )
             assert resp.status_code == 503
         assert recorder.requests == []
@@ -596,7 +644,7 @@ async def test_control_plane_mcp_proxy_fails_closed_when_internal_secret_unconfi
         assert gateway_events[0].status_code == 503
 
 
-async def test_control_plane_mcp_proxy_strips_auth_mints_assertion_and_routes() -> None:
+async def test_control_plane_mcp_forwarding_strips_auth_mints_assertion_and_routes() -> None:
     keypair = generate_rsa_keypair(seed="mcp-e2e-test")
     ops_jwt = mint_rs256_jwt(
         private_pem=keypair.private_pem,
@@ -676,7 +724,7 @@ async def test_control_plane_mcp_proxy_strips_auth_mints_assertion_and_routes() 
                 "Content-Type": "application/json",
                 "Accept": "application/json",
                 "Authorization": f"Bearer {ops_jwt}",
-                INTERNAL_IDENTITY_HEADER: "spoofed-caller-assertion",
+                INTERNAL_IDENTITY_HEADER: "spoofed-actor-assertion",
             },
         )
         assert list_resp.status_code == 200
@@ -732,7 +780,7 @@ async def test_control_plane_mcp_proxy_strips_auth_mints_assertion_and_routes() 
         assert "authorization" not in req.headers
         assertion_hdr = req.headers.get(INTERNAL_IDENTITY_HEADER)
         assert assertion_hdr is not None
-        assert assertion_hdr != "spoofed-caller-assertion"
+        assert assertion_hdr != "spoofed-actor-assertion"
         assert "application/json" in req.headers.get("accept", "")
         assert "text/event-stream" in req.headers.get("accept", "")
 
@@ -754,7 +802,7 @@ async def test_control_plane_mcp_proxy_strips_auth_mints_assertion_and_routes() 
     assert verified_req_3.role == "developer"
     assert verified_req_3.run_id == "run-explicit-dev-1"
 
-    # Also verify GET /mcp SSE passthrough through the Control Plane proxy
+    # Also verify GET /mcp SSE passthrough through the Control Plane
     class _SseGetTransport(httpx.AsyncBaseTransport):
         def __init__(self) -> None:
             self.requests: list[httpx.Request] = []
@@ -791,9 +839,9 @@ async def test_control_plane_mcp_proxy_strips_auth_mints_assertion_and_routes() 
     assert INTERNAL_IDENTITY_HEADER in sse_transport.requests[0].headers
 
 
-async def test_control_plane_mcp_proxy_returns_502_and_504_on_upstream_failures() -> None:
+async def test_control_plane_mcp_forwarding_returns_502_and_504_on_upstream_failures() -> None:
     keypair = generate_rsa_keypair(seed="mcp-errors-test")
-    token = mint_rs256_jwt(
+    jwt_credential = mint_rs256_jwt(
         private_pem=keypair.private_pem,
         kid=keypair.kid,
         actor_id="ops-erin",
@@ -833,14 +881,14 @@ async def test_control_plane_mcp_proxy_returns_502_and_504_on_upstream_failures(
         resp_502 = await c_unreach.post(
             "/mcp",
             json=_jsonrpc_call("tools/list"),
-            headers={**MCP_HEADERS, "Authorization": f"Bearer {token}"},
+            headers={**MCP_HEADERS, "Authorization": f"Bearer {jwt_credential}"},
         )
         assert resp_502.status_code == 502
 
         resp_504 = await c_timeout.post(
             "/mcp",
             json=_jsonrpc_call("tools/list"),
-            headers={**MCP_HEADERS, "Authorization": f"Bearer {token}"},
+            headers={**MCP_HEADERS, "Authorization": f"Bearer {jwt_credential}"},
         )
         assert resp_504.status_code == 504
 
@@ -857,7 +905,7 @@ async def test_control_plane_mcp_rbac_developer_ops_admin_and_cross_team_denial(
     ops_jwt = mint_rs256_jwt(
         private_pem=keypair.private_pem,
         kid=keypair.kid,
-        actor_id="ops-user-1",
+        actor_id="ops-actor-1",
         team="ops-eng",
         role="ops",
     )
@@ -1029,7 +1077,7 @@ async def test_control_plane_mcp_rbac_developer_ops_admin_and_cross_team_denial(
 
 async def test_control_plane_mcp_per_call_execution_timeout_returns_504() -> None:
     keypair = generate_rsa_keypair(seed="mcp-timeout-test")
-    token = mint_rs256_jwt(
+    jwt_credential = mint_rs256_jwt(
         private_pem=keypair.private_pem,
         kid=keypair.kid,
         actor_id="ops-timeout",
@@ -1068,7 +1116,11 @@ async def test_control_plane_mcp_per_call_execution_timeout_returns_504() -> Non
                 {"name": "query_runbook", "arguments": {"query": "timeout"}},
                 rpc_id=10,
             ),
-            headers={**MCP_HEADERS, "Authorization": f"Bearer {token}", "X-Run-Id": "run-to-1"},
+            headers={
+                **MCP_HEADERS,
+                "Authorization": f"Bearer {jwt_credential}",
+                "X-Run-Id": "run-to-1",
+            },
         )
         assert resp.status_code == 504
         assert resp.headers["x-policy-denial-reason"] == "mcp_tool_timeout"
@@ -1086,7 +1138,7 @@ async def test_control_plane_mcp_per_call_execution_timeout_returns_504() -> Non
 
 async def test_mcp_run_loop_cap_enforced_across_two_runtime_replicas_sharing_redis() -> None:
     keypair = generate_rsa_keypair(seed="mcp-loop-cap-test")
-    token = mint_rs256_jwt(
+    jwt_credential = mint_rs256_jwt(
         private_pem=keypair.private_pem,
         kid=keypair.kid,
         actor_id="ops-loop",
@@ -1153,7 +1205,11 @@ async def test_mcp_run_loop_cap_enforced_across_two_runtime_replicas_sharing_red
         list_resp = await client.post(
             "/mcp",
             json=_jsonrpc_call("tools/list", rpc_id=1),
-            headers={**MCP_HEADERS, "Authorization": f"Bearer {token}", "X-Run-Id": "run-cap-1"},
+            headers={
+                **MCP_HEADERS,
+                "Authorization": f"Bearer {jwt_credential}",
+                "X-Run-Id": "run-cap-1",
+            },
         )
         assert list_resp.status_code == 200
 
@@ -1167,7 +1223,7 @@ async def test_mcp_run_loop_cap_enforced_across_two_runtime_replicas_sharing_red
                 ),
                 headers={
                     **MCP_HEADERS,
-                    "Authorization": f"Bearer {token}",
+                    "Authorization": f"Bearer {jwt_credential}",
                     "X-Run-Id": "run-cap-1",
                 },
             )
@@ -1182,7 +1238,11 @@ async def test_mcp_run_loop_cap_enforced_across_two_runtime_replicas_sharing_red
                 {"name": "query_runbook", "arguments": {"query": "loop"}},
                 rpc_id=5,
             ),
-            headers={**MCP_HEADERS, "Authorization": f"Bearer {token}", "X-Run-Id": "run-cap-1"},
+            headers={
+                **MCP_HEADERS,
+                "Authorization": f"Bearer {jwt_credential}",
+                "X-Run-Id": "run-cap-1",
+            },
         )
         assert capped_resp.status_code == 429
         assert capped_resp.headers["x-policy-denial-reason"] == "mcp_run_loop_cap_exceeded"
@@ -1196,7 +1256,11 @@ async def test_mcp_run_loop_cap_enforced_across_two_runtime_replicas_sharing_red
                 {"name": "query_runbook", "arguments": {"query": "loop"}},
                 rpc_id=6,
             ),
-            headers={**MCP_HEADERS, "Authorization": f"Bearer {token}", "X-Run-Id": "run-cap-2"},
+            headers={
+                **MCP_HEADERS,
+                "Authorization": f"Bearer {jwt_credential}",
+                "X-Run-Id": "run-cap-2",
+            },
         )
         assert other_run_resp.status_code == 200
         assert other_run_resp.headers["x-mcp-run-calls"] == "1"
@@ -1209,7 +1273,7 @@ async def test_mcp_run_loop_cap_enforced_across_two_runtime_replicas_sharing_red
 
 async def test_mcp_runtime_fails_closed_with_503_when_redis_unavailable_or_errors() -> None:
     keypair = generate_rsa_keypair(seed="mcp-redis-down")
-    token = mint_rs256_jwt(
+    jwt_credential = mint_rs256_jwt(
         private_pem=keypair.private_pem,
         kid=keypair.kid,
         actor_id="ops-redis",
@@ -1253,7 +1317,7 @@ async def test_mcp_runtime_fails_closed_with_503_when_redis_unavailable_or_error
                     "tools/call",
                     {"name": "query_runbook", "arguments": {"query": "redis"}},
                 ),
-                headers={**MCP_HEADERS, "Authorization": f"Bearer {token}"},
+                headers={**MCP_HEADERS, "Authorization": f"Bearer {jwt_credential}"},
             )
             assert resp.status_code == 503
             assert resp.headers["x-policy-denial-reason"] == "redis_unavailable"
@@ -1310,7 +1374,7 @@ async def test_mcp_audit_privacy_otel_trace_correlation_and_prometheus_metrics(
     )
 
     secret_arg_marker = "CONFIDENTIAL_TOOL_ARGUMENT_MARKER_999"
-    pii_email_arg = "sensitive.caller@corp.example.com"
+    pii_email_arg = "sensitive.actor@corp.example.com"
     incoming_trace_id = "0af7651916cd43dd8448eb211c80319c"
     incoming_parent_span_id = "b7ad6b7169203331"
     incoming_traceparent = f"00-{incoming_trace_id}-{incoming_parent_span_id}-01"

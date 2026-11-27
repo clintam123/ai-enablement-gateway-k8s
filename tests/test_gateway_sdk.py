@@ -38,14 +38,14 @@ def _build_full_stack(
     ops_jwt = mint_rs256_jwt(
         private_pem=keypair.private_pem,
         kid=keypair.kid,
-        actor_id="sdk-ops-user",
+        actor_id="sdk-ops-actor",
         team="ops-eng",
         role="ops",
     )
     dev_jwt = mint_rs256_jwt(
         private_pem=keypair.private_pem,
         kid=keypair.kid,
-        actor_id="sdk-dev-user",
+        actor_id="sdk-dev-actor",
         team="product-eng",
         role="developer",
     )

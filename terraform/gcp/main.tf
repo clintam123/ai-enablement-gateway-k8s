@@ -63,6 +63,96 @@ locals {
   )
   fallback_public_key_sha256 = sha256(tls_private_key.ephemeral_fallback.public_key_pem)
   wire_gemini_provider       = var.enable_gemini_provider && var.gemini_api_key != ""
+  litellm_gemini_config_yaml = yamlencode({
+    model_list = [
+      {
+        model_name = "chat-default"
+        litellm_params = {
+          model   = "gemini/gemini-2.5-flash"
+          api_key = "os.environ/GEMINI_API_KEY"
+        }
+        model_info = {
+          id = "chat-default-gemini"
+        }
+      },
+      {
+        model_name = "chat-fast"
+        litellm_params = {
+          model    = "openai/chat-fast"
+          api_base = "http://mock-llm-primary:8000/v1"
+          api_key  = "mock-unused"
+        }
+        model_info = {
+          id = "chat-fast-primary"
+        }
+      },
+      {
+        model_name = "chat-premium"
+        litellm_params = {
+          model    = "openai/chat-premium"
+          api_base = "http://mock-llm-primary:8000/v1"
+          api_key  = "mock-unused"
+        }
+        model_info = {
+          id = "chat-premium-primary"
+        }
+      },
+      {
+        model_name = "chat-default-fallback"
+        litellm_params = {
+          model    = "openai/chat-default"
+          api_base = "http://mock-llm-fallback:8000/v1"
+          api_key  = "mock-unused"
+        }
+        model_info = {
+          id = "chat-default-fallback"
+        }
+      },
+      {
+        model_name = "chat-fast-fallback"
+        litellm_params = {
+          model    = "openai/chat-fast"
+          api_base = "http://mock-llm-fallback:8000/v1"
+          api_key  = "mock-unused"
+        }
+        model_info = {
+          id = "chat-fast-fallback"
+        }
+      },
+      {
+        model_name = "chat-premium-fallback"
+        litellm_params = {
+          model    = "openai/chat-premium"
+          api_base = "http://mock-llm-fallback:8000/v1"
+          api_key  = "mock-unused"
+        }
+        model_info = {
+          id = "chat-premium-fallback"
+        }
+      },
+    ]
+    litellm_settings = {
+      drop_params     = true
+      num_retries     = 2
+      request_timeout = 15
+      fallbacks = [
+        { "chat-default" = ["chat-default-fallback"] },
+        { "chat-fast" = ["chat-fast-fallback"] },
+        { "chat-premium" = ["chat-premium-fallback"] },
+      ]
+    }
+    router_settings = {
+      routing_strategy = "simple-shuffle"
+      num_retries      = 2
+      timeout          = 15
+      allowed_fails    = 3
+      cooldown_time    = 30
+    }
+    general_settings = {
+      master_key                  = "os.environ/LITELLM_MASTER_KEY"
+      always_include_stream_usage = true
+    }
+  })
 }
 
 resource "google_project_service" "required" {
@@ -247,6 +337,13 @@ resource "google_container_cluster" "autopilot" {
     google_project_service.required,
     google_compute_router_nat.nat,
   ]
+
+  lifecycle {
+    precondition {
+      condition     = length(var.master_authorized_cidr_blocks) > 0
+      error_message = "At least one authorized CIDR block is required in master_authorized_cidr_blocks so kubectl, Helm, and Terraform can reach the GKE control plane endpoint (pass GCP_AUTHORIZED_CIDRS or use make gcp-up)."
+    }
+  }
 }
 
 resource "google_service_account" "gateway_control_plane" {
@@ -409,6 +506,13 @@ resource "helm_release" "ai_gateway" {
 
   values = [
     yamlencode({
+      configMaps = {
+        litellmConfigOverride = (
+          local.wire_gemini_provider
+          ? local.litellm_gemini_config_yaml
+          : ""
+        )
+      }
       secrets = {
         router = {
           providerKeysExistingSecret = (
@@ -471,11 +575,11 @@ resource "helm_release" "ai_gateway" {
         resources = {
           requests = {
             cpu    = "250m"
-            memory = "512Mi"
+            memory = "1Gi"
           }
           limits = {
             cpu    = "500m"
-            memory = "1Gi"
+            memory = "1536Mi"
           }
         }
       }

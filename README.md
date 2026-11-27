@@ -20,8 +20,8 @@ flowchart LR
     Prom["Prometheus (dns_sd_configs)"] -->|"Scrape /metrics :8000"| CP
     CP -->|"OTLP HTTP :4318"| Jaeger["Jaeger v2 Traces"]
     MCP -->|"OTLP HTTP :4318"| Jaeger
-    Grafana["Grafana Dashboard"] -->|"PromQL + TraceQL"| Prom
-    Grafana --> Jaeger
+    Grafana["Grafana Dashboard"] -->|"PromQL"| Prom
+    Grafana -->|"Jaeger Query / TraceQL"| Jaeger
 ```
 
 ### Core Capabilities
@@ -93,12 +93,13 @@ Measured verbatim on `2026-11-27` (`k6 v2.4.0`) against live Kind + Calico + Tra
 
 | Scenario | Sample Size | Success / Accuracy | Latency (p50 / p95) | Measured Outcome |
 | :--- | ---: | ---: | ---: | :--- |
-| **Control Plane** Overhead (`normal_json` + `sse_stream`) | `91` | `100.00%` | `3.299 ms` / `4.977 ms` | Exact `gateway_overhead_duration_seconds_bucket` delta (`mean = 3.246 ms`); PromQL across `4` HPA pods: `2.024 ms` p50 / `13.736 ms` p95 |
-| Normal JSON (`POST /v1/chat/completions`) | `61` | `100.00%` | `19.147 ms` / `28.672 ms` | `5.074` RPS (`min = 7.783 ms`, `max = 53.594 ms`, `X-Fallback-Used: false`) |
-| SSE Streaming (`stream: true`) | `30` | `100.00%` | `23.198 ms` / `32.121 ms` | `3.000` RPS; `text/event-stream` + `"usage"` chunk + `[DONE]` |
-| Primary -> Fallback Failover (`/admin/fault`) | `13` | `100.00%` | `4782.615 ms` / `5431.677 ms` | `X-Fallback-Used: true` (`mock-llm-fallback`) during `fail_503`, then clean recovery to `mock-llm-primary` |
-| **Team** **Budget Quota** / RPM `429` (`product-eng`) | `90` | `100.00%` block accuracy | — | `60` HTTP `200` allowed, `30` HTTP `429` blocked (`0` leaks, all rate-limit headers valid) |
-| HPA Sustained Scale-Out (`platform-eng` override) | `32103` | `99.69%` (`356.696` RPS) | `44.974 ms` / `69.004 ms` | CPU peaked at `488%` (`100m` request); scaled `1 -> 4` Ready replicas (`policy_restored: true`) |
+| **Control Plane** Overhead (`normal_json` + `sse_stream`) | `90` | `100.00%` | `3.387 ms` / `5.625 ms` | Exact `gateway_overhead_duration_seconds_bucket` delta (`mean = 3.428 ms`); PromQL across `4` HPA pods: `2.181 ms` p50 / `18.936 ms` p95 |
+| Normal JSON (`POST /v1/chat/completions`) | `60` | `100.00%` | `20.477 ms` / `24.628 ms` | `4.999` RPS (`min = 6.754 ms`, `max = 47.958 ms`, `X-Fallback-Used: false`) |
+| SSE Streaming (`stream: true`) | `30` | `100.00%` | `25.369 ms` / `34.599 ms` | `3.000` RPS; `text/event-stream` + `"usage"` chunk + `[DONE]` |
+| Primary -> Fallback Failover (`/admin/fault`) | `13` | `100.00%` | `4743.036 ms` / `5339.048 ms` | `X-Fallback-Used: true` (`mock-llm-fallback`) during `fail_503`, then clean recovery to `mock-llm-primary` |
+| **Team** RPM `429` (`product-eng`, `rpm_limit_exceeded`) | `90` | `100.00%` block accuracy | — | `60` HTTP `200` allowed, `30` HTTP `429` blocked (`0` leaks, all rate-limit headers valid) |
+| **Team** Daily USD **Budget Quota** `429` (`ops-eng`, `budget_quota_exceeded`) | `30` | `100.00%` block accuracy | — | `4` HTTP `200` allowed, `26` HTTP `429` blocked (`$0.009595` limit, `$0.007715` spend, `0.0` USD leaks, `26` denials recorded) |
+| HPA Sustained Scale-Out (`platform-eng` override) | `30595` | `99.997%` (`339.934` RPS) | `47.887 ms` / `95.958 ms` | CPU peaked at `489%` (`100m` request); scaled `1 -> 4` Ready replicas (`policy_restored: true`) |
 
 ## Documentation Map
 

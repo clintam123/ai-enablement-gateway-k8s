@@ -3,12 +3,10 @@
 from __future__ import annotations
 
 import asyncio
-import inspect
 import json
-import logging
 import time
 import uuid
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any
@@ -35,35 +33,25 @@ from mcp_runtime.telemetry import (
 from mcp_runtime.tools import ACTOR_ASSERTION_CTX, build_mcp_server
 from platform_common import (
     INTERNAL_IDENTITY_HEADER,
-    MIN_INTERNAL_IDENTITY_SECRET_BYTES,
+    AuditEmitter,
     AuditEvent,
+    AuditSink,
     InternalIdentityAssertion,
     InternalIdentityError,
     LoadedPolicyBundle,
+    authorize_mcp_tool,
     load_policy_bundle,
+    validate_internal_identity_secret,
     verify_internal_identity_assertion,
 )
 
 MCP_AUDIT_LOGGER_NAME = "mcp_runtime.audit"
-
-AuditSink = Callable[[AuditEvent], Any] | list[AuditEvent]
 
 _JSONRPC_INTERNAL_ERROR = -32000
 _JSONRPC_AUTH_ERROR = -32001
 _JSONRPC_RBAC_ERROR = -32003
 _JSONRPC_TIMEOUT_ERROR = -32004
 _JSONRPC_LOOP_CAP_ERROR = -32029
-
-
-def _is_mcp_path(path: str) -> bool:
-    return path == "/mcp" or path.startswith("/mcp/")
-
-
-def _is_secret_configured(secret: str | None) -> bool:
-    return (
-        isinstance(secret, str)
-        and len(secret.encode("utf-8")) >= MIN_INTERNAL_IDENTITY_SECRET_BYTES
-    )
 
 
 def _get_header(
@@ -200,31 +188,6 @@ class _RequestOutcome:
     triggered_rules: list[str] | None = None
 
 
-class AuditEmitter:
-    """Structured 1-line JSON logger and optional injectable Audit Event sink."""
-
-    def __init__(
-        self,
-        audit_sink: AuditSink | None = None,
-        *,
-        logger_name: str = MCP_AUDIT_LOGGER_NAME,
-    ) -> None:
-        self._audit_sink = audit_sink
-        self._logger = logging.getLogger(logger_name)
-
-    async def emit(self, event: AuditEvent) -> None:
-        """Emit one privacy-safe JSON Audit Event to the logger and optional sink."""
-        self._logger.info(event.model_dump_json())
-        if self._audit_sink is None:
-            return
-        if isinstance(self._audit_sink, list):
-            self._audit_sink.append(event)
-            return
-        result = self._audit_sink(event)
-        if inspect.isawaitable(result):
-            await result
-
-
 class MCPGuardAndAuditMiddleware:
     """Pure ASGI L7 zero-trust guard, RBAC, loop cap, timeout, and Audit middleware for /mcp."""
 
@@ -252,22 +215,19 @@ class MCPGuardAndAuditMiddleware:
         tool_name: str,
         arguments: Any,
     ) -> str | None:
-        team_policy = self.loaded_policy.bundle.teams.get(assertion.team)
-        if team_policy is None:
-            return "team_not_allowed"
-        allowed_tools = team_policy.mcp_tool_allowlist.get(assertion.role, ())
-        if tool_name not in allowed_tools:
-            return "mcp_tool_not_allowed"
-        if (
-            tool_name == "check_model_catalog"
-            and assertion.role != "admin"
-            and isinstance(arguments, dict)
-            and isinstance(arguments.get("team"), str)
-        ):
-            requested_team = arguments["team"].strip()
-            if requested_team != assertion.team:
-                return "mcp_cross_team_denied"
-        return None
+        target_team = (
+            arguments.get("team")
+            if isinstance(arguments, dict) and isinstance(arguments.get("team"), str)
+            else None
+        )
+        allowed, denial_reason = authorize_mcp_tool(
+            self.loaded_policy.bundle,
+            team=assertion.team,
+            role=assertion.role,
+            tool_name=tool_name,
+            target_team=target_team,
+        )
+        return None if allowed else denial_reason
 
     async def _send_rejection(
         self,
@@ -308,8 +268,9 @@ class MCPGuardAndAuditMiddleware:
         state: _RequestOutcome,
         extra_headers: dict[str, str],
     ) -> InternalIdentityAssertion | None:
-        secret = self.settings.internal_identity_secret
-        if not _is_secret_configured(secret):
+        try:
+            secret = validate_internal_identity_secret(self.settings.internal_identity_secret)
+        except ValueError:
             await self._send_rejection(
                 send,
                 state=state,
@@ -324,7 +285,6 @@ class MCPGuardAndAuditMiddleware:
             )
             return None
 
-        assert secret is not None
         raw_assertion = _get_header(headers, INTERNAL_IDENTITY_HEADER)
         try:
             return verify_internal_identity_assertion(
@@ -457,7 +417,7 @@ class MCPGuardAndAuditMiddleware:
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         path = scope.get("path", "")
-        if scope["type"] != "http" or not _is_mcp_path(path):
+        if scope["type"] != "http" or path != "/mcp":
             await self.app(scope, receive, send)
             return
 
@@ -634,7 +594,7 @@ def create_app(
     """Create the Guarded MCP Runtime FastAPI application."""
     resolved_settings = settings or MCPRuntimeSettings()
     loaded_policy = load_policy_bundle(resolved_settings.policy_bundle_path)
-    audit_emitter = AuditEmitter(audit_sink)
+    audit_emitter = AuditEmitter(audit_sink, logger_name=MCP_AUDIT_LOGGER_NAME)
     resolved_delay = (
         tool_delay_seconds
         if tool_delay_seconds is not None
@@ -714,7 +674,9 @@ def create_app(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 content={"status": "not_ready", "reason": "policy_not_loaded"},
             )
-        if not _is_secret_configured(resolved_settings.internal_identity_secret):
+        try:
+            validate_internal_identity_secret(resolved_settings.internal_identity_secret)
+        except ValueError:
             return JSONResponse(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 content={"status": "not_ready", "reason": "internal_identity_unconfigured"},

@@ -22,6 +22,11 @@ const quota429HeadersValidRate = new Rate('quota_429_headers_valid_rate');
 const quotaAllowed200Total = new Counter('quota_allowed_200_total');
 const quotaBlocked429Total = new Counter('quota_blocked_429_total');
 
+const budget429Rate = new Rate('budget_429_rate');
+const budget429HeadersValidRate = new Rate('budget_429_headers_valid_rate');
+const budgetAllowed200Total = new Counter('budget_allowed_200_total');
+const budgetBlocked429Total = new Counter('budget_blocked_429_total');
+
 const hpaLatencyMs = new Trend('hpa_latency_ms', true);
 const hpaSuccessRate = new Rate('hpa_success_rate');
 
@@ -62,6 +67,13 @@ const ALL_SCENARIO_CONFIGS = {
     maxDuration: '30s',
     exec: 'runQuotaExhaustion',
   },
+  budget_quota_exhaustion: {
+    executor: 'shared-iterations',
+    vus: Number(__ENV.BUDGET_QUOTA_VUS || 4),
+    iterations: Number(__ENV.BUDGET_QUOTA_ITERATIONS || 30),
+    maxDuration: '30s',
+    exec: 'runBudgetQuotaExhaustion',
+  },
   hpa_sustained: {
     executor: 'ramping-vus',
     startVUs: 4,
@@ -89,6 +101,10 @@ const ALL_THRESHOLDS = {
     quota_429_rate: ['rate>0.10'],
     quota_429_headers_valid_rate: ['rate==1.0'],
   },
+  budget_quota_exhaustion: {
+    budget_429_rate: ['rate>0.10'],
+    budget_429_headers_valid_rate: ['rate==1.0'],
+  },
   hpa_sustained: {
     hpa_success_rate: ['rate>0.95'],
   },
@@ -102,20 +118,25 @@ function buildSelectedOptions(mode) {
         sse_stream: { ...ALL_SCENARIO_CONFIGS.sse_stream, startTime: '13s' },
         failover: { ...ALL_SCENARIO_CONFIGS.failover, startTime: '24s' },
         quota_exhaustion: { ...ALL_SCENARIO_CONFIGS.quota_exhaustion, startTime: '30s' },
-        hpa_sustained: { ...ALL_SCENARIO_CONFIGS.hpa_sustained, startTime: '62s' },
+        budget_quota_exhaustion: {
+          ...ALL_SCENARIO_CONFIGS.budget_quota_exhaustion,
+          startTime: '62s',
+        },
+        hpa_sustained: { ...ALL_SCENARIO_CONFIGS.hpa_sustained, startTime: '94s' },
       },
       thresholds: {
         ...ALL_THRESHOLDS.normal_json,
         ...ALL_THRESHOLDS.sse_stream,
         ...ALL_THRESHOLDS.failover,
         ...ALL_THRESHOLDS.quota_exhaustion,
+        ...ALL_THRESHOLDS.budget_quota_exhaustion,
         ...ALL_THRESHOLDS.hpa_sustained,
       },
     };
   }
   if (!ALL_SCENARIO_CONFIGS[mode]) {
     throw new Error(
-      `Unsupported SCENARIO='${mode}'. Expected one of: normal_json, sse_stream, failover, quota_exhaustion, hpa_sustained, all.`,
+      `Unsupported SCENARIO='${mode}'. Expected one of: normal_json, sse_stream, failover, quota_exhaustion, budget_quota_exhaustion, hpa_sustained, all.`,
     );
   }
   return {
@@ -156,7 +177,7 @@ export function setup() {
   if (SCENARIO === 'normal_json' || SCENARIO === 'failover' || SCENARIO === 'hpa_sustained' || SCENARIO === 'all') {
     assertCredential(PLATFORM_CREDENTIAL, 'PLATFORM_CREDENTIAL');
   }
-  if (SCENARIO === 'sse_stream' || SCENARIO === 'all') {
+  if (SCENARIO === 'sse_stream' || SCENARIO === 'budget_quota_exhaustion' || SCENARIO === 'all') {
     assertCredential(OPS_CREDENTIAL, 'OPS_CREDENTIAL or PLATFORM_CREDENTIAL');
   }
   if (SCENARIO === 'quota_exhaustion' || SCENARIO === 'all') {
@@ -294,6 +315,7 @@ export function runQuotaExhaustion() {
     const limitReq = getHeader(res.headers, 'x-ratelimit-limit-requests');
     const remainingReq = getHeader(res.headers, 'x-ratelimit-remaining-requests');
     const budgetLimit = getHeader(res.headers, 'x-budget-limit-usd');
+    const budgetRemaining = getHeader(res.headers, 'x-budget-remaining-usd');
     const denialReason = getHeader(res.headers, 'x-policy-denial-reason');
 
     const headersOk = check(res, {
@@ -301,10 +323,66 @@ export function runQuotaExhaustion() {
       '429 includes X-RateLimit-Limit-Requests': () => Boolean(limitReq),
       '429 includes X-RateLimit-Remaining-Requests': () => remainingReq !== undefined,
       '429 includes X-Budget-Limit-USD': () => Boolean(budgetLimit),
+      '429 includes X-Budget-Remaining-USD': () => Boolean(budgetRemaining),
       '429 includes X-Policy-Denial-Reason': () =>
         denialReason === 'rpm_limit_exceeded' || denialReason === 'budget_quota_exceeded',
     });
     quota429HeadersValidRate.add(headersOk);
+  }
+}
+
+export function runBudgetQuotaExhaustion() {
+  const payload = JSON.stringify({
+    model: 'chat-premium',
+    max_tokens: 64,
+    messages: [{ role: 'user', content: 'Benchmark Team daily USD Budget Quota enforcement.' }],
+  });
+  const res = http.post(`${BASE_URL}/v1/chat/completions`, payload, {
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${OPS_CREDENTIAL}`,
+    },
+    responseCallback: http.expectedStatuses(200, 429),
+    tags: { scenario: 'budget_quota_exhaustion' },
+  });
+
+  const is200 = res.status === 200;
+  const is429 = res.status === 429;
+  check(res, {
+    'budget_quota status is 200 or 429': () => is200 || is429,
+  });
+
+  budget429Rate.add(is429);
+  benchmarkRequestsTotal.add(1);
+
+  if (is200) {
+    budgetAllowed200Total.add(1);
+    return;
+  }
+
+  if (is429) {
+    budgetBlocked429Total.add(1);
+    const parsed = parseJsonBody(res);
+    const errorCode = parsed && parsed.error ? parsed.error.code : undefined;
+    const retryAfter = getHeader(res.headers, 'retry-after');
+    const limitReq = getHeader(res.headers, 'x-ratelimit-limit-requests');
+    const remainingReq = getHeader(res.headers, 'x-ratelimit-remaining-requests');
+    const budgetLimit = getHeader(res.headers, 'x-budget-limit-usd');
+    const budgetRemaining = getHeader(res.headers, 'x-budget-remaining-usd');
+    const denialReason = getHeader(res.headers, 'x-policy-denial-reason');
+
+    const headersOk = check(res, {
+      'budget 429 includes Retry-After': () => Boolean(retryAfter),
+      'budget 429 includes X-RateLimit-Limit-Requests': () => Boolean(limitReq),
+      'budget 429 includes X-RateLimit-Remaining-Requests': () => remainingReq !== undefined,
+      'budget 429 includes X-Budget-Limit-USD': () => Boolean(budgetLimit),
+      'budget 429 includes X-Budget-Remaining-USD': () => Boolean(budgetRemaining),
+      'budget 429 X-Policy-Denial-Reason is budget_quota_exceeded': () =>
+        denialReason === 'budget_quota_exceeded',
+      'budget 429 error.code is budget_quota_exceeded': () =>
+        errorCode === 'budget_quota_exceeded',
+    });
+    budget429HeadersValidRate.add(headersOk);
   }
 }
 

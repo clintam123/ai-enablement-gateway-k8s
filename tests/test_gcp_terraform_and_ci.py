@@ -148,9 +148,24 @@ def test_gcp_terraform_fmt_validate_and_contract(tmp_path: Path) -> None:
         "ai-gateway-provider-keys",
         "GEMINI_API_KEY",
         "allowExternalProviderEgress = var.enable_gemini_provider",
+        "litellmConfigOverride",
+        "local.wire_gemini_provider",
+        "local.litellm_gemini_config_yaml",
+        "gemini/gemini-2.5-flash",
+        "os.environ/GEMINI_API_KEY",
+        "chat-default",
+        "chat-fast",
+        "chat-premium",
+        "chat-default-fallback",
+        "chat-fast-fallback",
+        "chat-premium-fallback",
+        'memory = "1Gi"',
+        'memory = "1536Mi"',
+        "length(var.master_authorized_cidr_blocks) > 0",
         "../../deploy/helm/ai-enablement-platform",
     ):
         assert expected_snippet in main_hcl
+    assert 'memory = "512Mi"' not in main_hcl
 
     outputs_hcl = (TF_GCP_DIR / "outputs.tf").read_text(encoding="utf-8")
     for required_output in (
@@ -169,6 +184,8 @@ def test_makefile_defines_gcp_and_security_scan_targets() -> None:
     for target in ("gcp-up:", "gcp-down:", "checkov:", "trivy:"):
         assert target in makefile
     assert "terraform/gcp" in makefile
+    assert "GCP_AUTHORIZED_CIDRS" in makefile
+    assert '-var="master_authorized_cidr_blocks=' in makefile
     assert "--skip-check" not in makefile
     assert "checkov" in makefile
     assert "trivy" in makefile

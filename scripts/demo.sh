@@ -334,13 +334,13 @@ echo "Fault cleared on mock-llm-primary; waiting for LiteLLM cooldown recovery..
 uv run python - "$BASE_URL" "$PLATFORM_JWT" <<'PY'
 import sys, time
 import httpx
-base_url, token = sys.argv[1], sys.argv[2]
+base_url, jwt_credential = sys.argv[1], sys.argv[2]
 deadline = time.monotonic() + 45.0
 with httpx.Client(base_url=base_url, timeout=10.0) as client:
     while time.monotonic() < deadline:
         r = client.post(
             "/v1/chat/completions",
-            headers={"Authorization": f"Bearer {token}"},
+            headers={"Authorization": f"Bearer {jwt_credential}"},
             json={"model": "chat-default", "messages": [{"role": "user", "content": "Recovery check"}]},
         )
         if r.status_code == 200 and r.headers.get("x-fallback-used") == "false":
@@ -366,6 +366,7 @@ required = (
     "x-ratelimit-limit-requests",
     "x-ratelimit-remaining-requests",
     "x-budget-limit-usd",
+    "x-budget-remaining-usd",
     "x-policy-denial-reason",
 )
 

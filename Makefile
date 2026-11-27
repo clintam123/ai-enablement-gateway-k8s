@@ -10,6 +10,7 @@ GCP_REGION ?= us-central1
 GCP_CLUSTER_NAME ?= ai-enablement-gateway-gcp
 GCP_ARTIFACT_REPO ?= ai-enablement-gateway
 GCP_IMAGE_TAG ?= dev
+GCP_AUTHORIZED_CIDRS ?=
 ENABLE_GEMINI_PROVIDER ?= false
 GEMINI_API_KEY ?=
 
@@ -53,6 +54,13 @@ gcp-up:
 	docker push "$(GCP_REGION)-docker.pkg.dev/$(GCP_PROJECT_ID)/$(GCP_ARTIFACT_REPO)/ai-gateway-api:$(GCP_IMAGE_TAG)"
 	docker push "$(GCP_REGION)-docker.pkg.dev/$(GCP_PROJECT_ID)/$(GCP_ARTIFACT_REPO)/ai-mcp-runtime:$(GCP_IMAGE_TAG)"
 	docker push "$(GCP_REGION)-docker.pkg.dev/$(GCP_PROJECT_ID)/$(GCP_ARTIFACT_REPO)/ai-mock-llm:$(GCP_IMAGE_TAG)"
+	@authorized_cidrs="$(GCP_AUTHORIZED_CIDRS)"; \
+	if [ -z "$$authorized_cidrs" ]; then \
+		detected_ip="$$(curl -fsS https://checkip.amazonaws.com | tr -d '[:space:]')"; \
+		test -n "$$detected_ip" || (echo "Failed to detect public IP; set GCP_AUTHORIZED_CIDRS=<cidr>/32" && exit 1); \
+		authorized_cidrs="$${detected_ip}/32"; \
+	fi; \
+	authorized_hcl="$$(uv run python -c 'import json, sys; raw = sys.argv[1].strip(); print(raw if raw.startswith("[") else json.dumps([{"cidr_block": c.strip(), "display_name": f"authorized-{i}"} for i, c in enumerate(raw.split(","), 1) if c.strip()]))' "$$authorized_cidrs")"; \
 	terraform -chdir=$(GCP_TF_DIR) apply -auto-approve -input=false \
 		-var="project_id=$(GCP_PROJECT_ID)" \
 		-var="region=$(GCP_REGION)" \
@@ -61,6 +69,7 @@ gcp-up:
 		-var="image_tag=$(GCP_IMAGE_TAG)" \
 		-var="enable_gemini_provider=$(ENABLE_GEMINI_PROVIDER)" \
 		-var="gemini_api_key=$(GEMINI_API_KEY)" \
+		-var="master_authorized_cidr_blocks=$$authorized_hcl" \
 		-var-file="$(LOCAL_DIR)/local.tfvars.json"
 
 gcp-down:

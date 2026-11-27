@@ -203,13 +203,40 @@ def merge_overhead_deltas(deltas: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def parse_policy_denials_sample(
+    metrics_text: str,
+    *,
+    team: str,
+    reason: str,
+) -> float:
+    """Extract gateway_policy_denials_total sample value for one Team and denial reason."""
+    total = 0.0
+    for raw_line in metrics_text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        match = _METRIC_LINE_RE.match(line)
+        if match is None:
+            continue
+        metric_name, raw_labels, raw_value = match.groups()
+        if metric_name != "gateway_policy_denials_total":
+            continue
+        labels = _parse_labels(raw_labels)
+        if labels.get("team") == team and labels.get("reason") == reason:
+            total += float(raw_value)
+    return total
+
+
 def build_hpa_benchmark_policy_override(
     policy_path: Path = DEFAULT_POLICY_BUNDLE_PATH,
     *,
     platform_rpm: int = 100_000,
     platform_daily_budget_usd: float = 10_000.0,
+    ops_rpm: int | None = None,
+    ops_daily_budget_usd: float | None = None,
+    ops_allow_chat_premium: bool = False,
 ) -> str:
-    """Create temporary Policy Bundle YAML raising only platform-eng limits for HPA testing."""
+    """Create temporary Policy Bundle YAML for HPA and optional Budget Quota testing."""
     parsed = yaml.safe_load(policy_path.read_text(encoding="utf-8"))
     if not isinstance(parsed, dict) or not isinstance(parsed.get("teams"), dict):
         raise ValueError(f"Malformed Policy Bundle at {policy_path}")
@@ -218,6 +245,18 @@ def build_hpa_benchmark_policy_override(
         raise ValueError("Policy Bundle missing 'platform-eng' Team")
     teams["platform-eng"]["requests_per_minute"] = platform_rpm
     teams["platform-eng"]["daily_budget_usd"] = platform_daily_budget_usd
+    if ops_rpm is not None or ops_daily_budget_usd is not None or ops_allow_chat_premium:
+        if "ops-eng" not in teams:
+            raise ValueError("Policy Bundle missing 'ops-eng' Team")
+        if ops_rpm is not None:
+            teams["ops-eng"]["requests_per_minute"] = ops_rpm
+        if ops_daily_budget_usd is not None:
+            teams["ops-eng"]["daily_budget_usd"] = ops_daily_budget_usd
+        if ops_allow_chat_premium:
+            aliases = list(teams["ops-eng"].get("allowed_model_aliases") or [])
+            if "chat-premium" not in aliases:
+                aliases.append("chat-premium")
+            teams["ops-eng"]["allowed_model_aliases"] = aliases
     return yaml.safe_dump(parsed, sort_keys=False)
 
 
@@ -619,6 +658,37 @@ def _wait_for_rollout(
         )
 
 
+def _read_team_budget_micros(
+    *,
+    namespace: str,
+    team: str,
+    kubectl_runner: KubectlRunner,
+    release_name: str = DEFAULT_RELEASE_NAME,
+) -> int:
+    utc_date = datetime.now(UTC).strftime("%Y-%m-%d")
+    proc = kubectl_runner(
+        [
+            "exec",
+            "-n",
+            namespace,
+            f"deploy/{release_name}-redis",
+            "--",
+            "redis-cli",
+            "GET",
+            f"budget:{team}:{utc_date}",
+        ]
+    )
+    if proc.returncode != 0:
+        return 0
+    raw = proc.stdout.strip()
+    if not raw or raw == "(nil)":
+        return 0
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 0
+
+
 def _detect_k6_version() -> str:
     k6_bin = shutil.which("k6")
     if k6_bin is not None:
@@ -761,9 +831,25 @@ def run_benchmarks(
             k6_runner=k6_runner,
         )
 
-        # Phase 5: HPA sustained scale-out under temporary platform-eng policy override
-        print("[5/5] Applying temporary benchmark Policy Bundle override for hpa_sustained...")
-        override_yaml = build_hpa_benchmark_policy_override(policy_bundle_path)
+        # Phase 5: Budget Quota 429 + HPA sustained scale-out under temporary policy override
+        print(
+            "[5/5] Applying temporary benchmark Policy Bundle override for "
+            "budget_quota_exhaustion & hpa_sustained..."
+        )
+        budget_window_usd = 0.005
+        ops_spend_before_micros = _read_team_budget_micros(
+            namespace=namespace,
+            team="ops-eng",
+            kubectl_runner=kubectl_runner,
+            release_name=release_name,
+        )
+        ops_budget_limit_usd = round((ops_spend_before_micros / 1_000_000) + budget_window_usd, 6)
+        override_yaml = build_hpa_benchmark_policy_override(
+            policy_bundle_path,
+            ops_rpm=600,
+            ops_daily_budget_usd=ops_budget_limit_usd,
+            ops_allow_chat_premium=True,
+        )
         override_path = work_dir / "policy-bundle-hpa-bench.yaml"
         override_path.write_text(override_yaml, encoding="utf-8")
 
@@ -794,6 +880,34 @@ def run_benchmarks(
                 deployment=f"{release_name}-mcp-runtime",
             )
             _wait_for_gateway_ready(base_url, http_transport=http_transport, timeout_seconds=60.0)
+
+            print("[4b/5] Running budget_quota_exhaustion benchmark (ops-eng daily_budget_usd)...")
+            before_budget_metrics = _scrape_gateway_metrics(
+                namespace=namespace,
+                port_forward_factory=port_forward_factory,
+                http_transport=http_transport,
+            )
+            budget_summary = _run_k6_phase(
+                scenario="budget_quota_exhaustion",
+                base_url=base_url,
+                platform_jwt=platform_jwt,
+                ops_api_key=ops_api_key,
+                product_api_key=product_api_key,
+                work_dir=work_dir,
+                k6_runner=k6_runner,
+            )
+            after_budget_metrics = _scrape_gateway_metrics(
+                namespace=namespace,
+                port_forward_factory=port_forward_factory,
+                http_transport=http_transport,
+            )
+            ops_spend_after_micros = _read_team_budget_micros(
+                namespace=namespace,
+                team="ops-eng",
+                kubectl_runner=kubectl_runner,
+                release_name=release_name,
+            )
+
             _poll_hpa()
 
             hpa_summary = _run_k6_phase(
@@ -859,6 +973,37 @@ def run_benchmarks(
         6,
     )
 
+    budget_allowed_200 = _extract_counter_count(budget_summary, "budget_allowed_200_total")
+    budget_blocked_429 = _extract_counter_count(budget_summary, "budget_blocked_429_total")
+    budget_total_reqs = _extract_counter_count(budget_summary, "http_reqs") or (
+        budget_allowed_200 + budget_blocked_429
+    )
+    budget_rate_info = _extract_rate_stats(budget_summary, "budget_429_rate")
+    budget_headers_valid_info = _extract_rate_stats(budget_summary, "budget_429_headers_valid_rate")
+    spend_before_usd = round(ops_spend_before_micros / 1_000_000, 6)
+    spend_after_usd = round(ops_spend_after_micros / 1_000_000, 6)
+    over_budget_leaks_usd = round(max(0.0, spend_after_usd - ops_budget_limit_usd), 6)
+    budget_denials_metric_delta = round(
+        max(
+            0.0,
+            parse_policy_denials_sample(
+                after_budget_metrics, team="ops-eng", reason="budget_quota_exceeded"
+            )
+            - parse_policy_denials_sample(
+                before_budget_metrics, team="ops-eng", reason="budget_quota_exceeded"
+            ),
+        ),
+        3,
+    )
+    budget_block_accuracy = (
+        1.0
+        if budget_allowed_200 > 0
+        and budget_blocked_429 > 0
+        and over_budget_leaks_usd == 0.0
+        and budget_headers_valid_info["value"] == 1.0
+        else 0.0
+    )
+
     observed_replicas = [max(s["current_replicas"], s["ready_replicas"]) for s in hpa_samples] or [
         1
     ]
@@ -919,12 +1064,30 @@ def run_benchmarks(
                 "requests": quota_total_reqs,
                 "team": "product-eng",
                 "rpm_limit": product_rpm_limit,
+                "denial_reason": "rpm_limit_exceeded",
                 "allowed_200": allowed_200,
                 "blocked_429": blocked_429,
                 "over_limit_leaks": over_limit_leaks,
                 "quota_429_rate": quota_rate_info["value"],
                 "headers_valid_rate": headers_valid_info["value"],
                 "block_accuracy": block_accuracy,
+                "budget_quota_exceeded": {
+                    "requests": budget_total_reqs,
+                    "team": "ops-eng",
+                    "model_alias": "chat-premium",
+                    "denial_reason": "budget_quota_exceeded",
+                    "budget_window_usd": budget_window_usd,
+                    "daily_budget_limit_usd": ops_budget_limit_usd,
+                    "spend_before_usd": spend_before_usd,
+                    "spend_after_usd": spend_after_usd,
+                    "over_budget_leaks_usd": over_budget_leaks_usd,
+                    "allowed_200": budget_allowed_200,
+                    "blocked_429": budget_blocked_429,
+                    "budget_429_rate": budget_rate_info["value"],
+                    "headers_valid_rate": budget_headers_valid_info["value"],
+                    "block_accuracy": budget_block_accuracy,
+                    "policy_denials_metric_delta": budget_denials_metric_delta,
+                },
             },
             "hpa_sustained": {
                 "requests": _extract_counter_count(hpa_summary, "http_reqs"),

@@ -59,7 +59,8 @@ class InternalIdentityError(Exception):
         self.message = message
 
 
-def _validate_secret(secret: str) -> str:
+def validate_internal_identity_secret(secret: str | None) -> str:
+    """Validate that the internal identity signing secret is configured and >= 32 bytes."""
     if (
         not isinstance(secret, str)
         or len(secret.encode("utf-8")) < MIN_INTERNAL_IDENTITY_SECRET_BYTES
@@ -101,7 +102,7 @@ def sign_internal_identity_assertion(
     now: int | None = None,
 ) -> str:
     """Mint a short-lived HS256 JWT asserting verified Actor, Run, and trace identity."""
-    validated_secret = _validate_secret(secret)
+    validated_secret = validate_internal_identity_secret(secret)
     if ttl_seconds < 1:
         raise ValueError("ttl_seconds must be at least 1")
 
@@ -139,7 +140,7 @@ def verify_internal_identity_assertion(
     leeway_seconds: int = 0,
 ) -> InternalIdentityAssertion:
     """Cryptographically verify an HS256 internal actor assertion issued by the Control Plane."""
-    validated_secret = _validate_secret(secret)
+    validated_secret = validate_internal_identity_secret(secret)
     if token is None or not isinstance(token, str) or not token.strip():
         raise InternalIdentityError(
             code="missing_assertion",

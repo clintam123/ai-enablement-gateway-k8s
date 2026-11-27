@@ -1,4 +1,4 @@
-"""Control Plane /mcp Streamable HTTP signed-identity proxy."""
+"""Control Plane /mcp Streamable HTTP signed-identity forwarder."""
 
 from __future__ import annotations
 
@@ -17,10 +17,10 @@ from gateway_api.config import ControlPlaneSettings
 from gateway_api.telemetry import inject_trace_headers
 from platform_common import (
     INTERNAL_IDENTITY_HEADER,
-    MIN_INTERNAL_IDENTITY_SECRET_BYTES,
     LoadedPolicyBundle,
     build_openai_error,
     sign_internal_identity_assertion,
+    validate_internal_identity_secret,
 )
 
 _PROPAGATED_UPSTREAM_HEADERS = (
@@ -89,8 +89,8 @@ def _infer_mcp_outcome(status_code: int, denial_reason: str | None) -> str:
     return "allowed"
 
 
-async def proxy_mcp_request(request: Request) -> Response:
-    """Authenticate caller, mint signed internal identity assertion, and proxy /mcp."""
+async def forward_mcp_request(request: Request) -> Response:
+    """Authenticate Actor, mint signed internal identity assertion, and forward /mcp."""
     settings: ControlPlaneSettings = request.app.state.settings
     loaded_policy: LoadedPolicyBundle = request.app.state.policy_bundle
     mcp_http_client: httpx.AsyncClient = request.app.state.mcp_http_client
@@ -113,11 +113,9 @@ async def proxy_mcp_request(request: Request) -> Response:
         "x-trace-id": trace_id,
     }
 
-    secret = settings.internal_identity_secret
-    if (
-        not isinstance(secret, str)
-        or len(secret.encode("utf-8")) < MIN_INTERNAL_IDENTITY_SECRET_BYTES
-    ):
+    try:
+        secret = validate_internal_identity_secret(settings.internal_identity_secret)
+    except ValueError:
         request.state.policy_action = "error"
         request.state.triggered_rules = ["internal_identity_secret_unconfigured"]
         request.state.outcome = "internal_auth_unconfigured"

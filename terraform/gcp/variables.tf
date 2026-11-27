@@ -124,7 +124,7 @@ variable "master_ipv4_cidr_block" {
 }
 
 variable "master_authorized_cidr_blocks" {
-  description = "Authorized CIDR blocks allowed to reach the GKE control plane endpoint."
+  description = "Authorized CIDR blocks allowed to reach the GKE control plane endpoint. At least one CIDR block is required when provisioning the cluster (passed via GCP_AUTHORIZED_CIDRS or auto-detected /32 in make gcp-up) so kubectl, Helm, and Terraform can access the API server."
   type = list(object({
     cidr_block   = string
     display_name = string

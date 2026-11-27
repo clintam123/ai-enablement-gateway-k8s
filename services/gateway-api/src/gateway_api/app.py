@@ -14,11 +14,11 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from opentelemetry import trace
 from opentelemetry.trace import TracerProvider
 
-from gateway_api.audit import AuditEmitter, AuditMiddleware, AuditSink
+from gateway_api.audit import AUDIT_LOGGER_NAME, AuditEmitter, AuditMiddleware, AuditSink
 from gateway_api.auth import AuthVerifier, GatewayAuthError, authenticate_and_authorize
 from gateway_api.config import ControlPlaneSettings
 from gateway_api.guardrails import GuardrailDeniedError, evaluate_guardrails
-from gateway_api.mcp_proxy import proxy_mcp_request
+from gateway_api.mcp_proxy import forward_mcp_request
 from gateway_api.quotas import (
     GatewayQuotaError,
     ensure_redis_ready,
@@ -53,7 +53,7 @@ def create_app(
     resolved_settings = settings or ControlPlaneSettings()
     loaded_policy: LoadedPolicyBundle = load_policy_bundle(resolved_settings.policy_bundle_path)
     auth_verifier = AuthVerifier(resolved_settings)
-    audit_emitter = AuditEmitter(audit_sink)
+    audit_emitter = AuditEmitter(audit_sink, logger_name=AUDIT_LOGGER_NAME)
     resolved_metrics = metrics or ControlPlaneMetrics()
     owns_tracer_provider = False
     if tracer_provider is not None:
@@ -135,7 +135,7 @@ def create_app(
         exc: GatewayAuthError,
     ) -> JSONResponse:
         request.state.policy_action = "deny"
-        if request.url.path == "/mcp" or request.url.path.startswith("/mcp/"):
+        if request.url.path == "/mcp":
             request.state.outcome = (
                 "auth_denied" if exc.status_code == status.HTTP_401_UNAUTHORIZED else "rbac_denied"
             )
@@ -323,7 +323,7 @@ def create_app(
         return response
 
     @app.api_route("/mcp", methods=["POST", "GET", "DELETE"])
-    async def mcp_proxy(request: Request) -> Response:
-        return await proxy_mcp_request(request)
+    async def mcp_endpoint(request: Request) -> Response:
+        return await forward_mcp_request(request)
 
     return app

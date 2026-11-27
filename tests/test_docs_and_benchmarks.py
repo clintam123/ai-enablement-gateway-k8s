@@ -38,6 +38,7 @@ def test_k6_benchmark_script_scenarios_and_makefile_target() -> None:
         "sse_success_rate",
         "failover_success_rate",
         "quota_429_rate",
+        "budget_429_rate",
     ):
         assert metric_name in js_text
     for scenario in (
@@ -45,6 +46,7 @@ def test_k6_benchmark_script_scenarios_and_makefile_target() -> None:
         "sse_stream",
         "failover",
         "quota_exhaustion",
+        "budget_quota_exhaustion",
         "hpa_sustained",
     ):
         assert scenario in js_text
@@ -57,6 +59,7 @@ def test_k6_benchmark_script_scenarios_and_makefile_target() -> None:
         "x-ratelimit-limit-requests",
         "x-ratelimit-remaining-requests",
         "x-budget-limit-usd",
+        "x-budget-remaining-usd",
         "x-policy-denial-reason",
     ):
         assert header_or_marker.lower() in js_text.lower()
@@ -68,6 +71,7 @@ def test_k6_benchmark_script_scenarios_and_makefile_target() -> None:
         "sse_stream",
         "failover",
         "quota_exhaustion",
+        "budget_quota_exhaustion",
         "hpa_sustained",
         "all",
     ):
@@ -132,6 +136,19 @@ def test_hpa_benchmark_policy_override_preserves_product_eng_limits() -> None:
     assert overridden["teams"]["ops-eng"] == canonical["teams"]["ops-eng"]
     assert overridden["safety_rules"] == canonical["safety_rules"]
 
+    budget_override = yaml.safe_load(
+        build_hpa_benchmark_policy_override(
+            POLICY_BUNDLE_PATH,
+            ops_rpm=600,
+            ops_daily_budget_usd=0.005,
+            ops_allow_chat_premium=True,
+        )
+    )
+    assert budget_override["teams"]["ops-eng"]["requests_per_minute"] == 600
+    assert budget_override["teams"]["ops-eng"]["daily_budget_usd"] == 0.005
+    assert "chat-premium" in budget_override["teams"]["ops-eng"]["allowed_model_aliases"]
+    assert budget_override["teams"]["product-eng"] == canonical["teams"]["product-eng"]
+
 
 def test_run_benchmarks_orchestration_restores_fault_and_policy_override_on_failure(
     tmp_path: Path,
@@ -146,6 +163,7 @@ def test_run_benchmarks_orchestration_restores_fault_and_policy_override_on_fail
     helm_calls: list[list[str]] = []
     k6_scenarios_seen: list[str] = []
     metrics_scrapes = 0
+    redis_exec_calls = 0
 
     def gateway_and_obs_handler(request: httpx.Request) -> httpx.Response:
         nonlocal metrics_scrapes
@@ -168,6 +186,7 @@ def test_run_benchmarks_orchestration_restores_fault_and_policy_override_on_fail
             metrics_scrapes += 1
             count = 0 if metrics_scrapes in (1, 3) else 40
             val = count * 0.004
+            budget_denials = 26.0 if metrics_scrapes >= 6 else 0.0
             route = 'route="/v1/chat/completions"'
             text = "\n".join(
                 [
@@ -176,6 +195,10 @@ def test_run_benchmarks_orchestration_restores_fault_and_policy_override_on_fail
                     f'gateway_overhead_duration_seconds_bucket{{{route},le="+Inf"}} {count}',
                     f"gateway_overhead_duration_seconds_sum{{{route}}} {val}",
                     f"gateway_overhead_duration_seconds_count{{{route}}} {count}",
+                    (
+                        'gateway_policy_denials_total{team="ops-eng",'
+                        f'reason="budget_quota_exceeded"}} {budget_denials}'
+                    ),
                 ]
             )
             return httpx.Response(200, text=text)
@@ -210,6 +233,11 @@ def test_run_benchmarks_orchestration_restores_fault_and_policy_override_on_fail
         yield port_map[(service_name, remote_port)]
 
     def fake_kubectl(args: list[str]) -> subprocess.CompletedProcess[str]:
+        nonlocal redis_exec_calls
+        if args[:1] == ["exec"]:
+            redis_exec_calls += 1
+            stdout = "0\n" if redis_exec_calls % 2 == 1 else "3120\n"
+            return subprocess.CompletedProcess(["kubectl", *args], 0, stdout=stdout, stderr="")
         if args[:2] == ["get", "hpa"]:
             return subprocess.CompletedProcess(
                 ["kubectl", *args],
@@ -316,6 +344,15 @@ def test_run_benchmarks_orchestration_restores_fault_and_policy_override_on_fail
                     "http_reqs": {"count": 90, "rate": 45.0},
                 }
             },
+            "budget_quota_exhaustion": {
+                "metrics": {
+                    "budget_429_rate": {"value": 26 / 30, "passes": 26, "fails": 4},
+                    "budget_429_headers_valid_rate": {"value": 1.0, "passes": 26, "fails": 0},
+                    "budget_allowed_200_total": {"count": 4},
+                    "budget_blocked_429_total": {"count": 26},
+                    "http_reqs": {"count": 30, "rate": 15.0},
+                }
+            },
             "hpa_sustained": {
                 "metrics": {
                     "hpa_latency_ms": {
@@ -351,6 +388,7 @@ def test_run_benchmarks_orchestration_restores_fault_and_policy_override_on_fail
         "sse_stream",
         "failover",
         "quota_exhaustion",
+        "budget_quota_exhaustion",
         "hpa_sustained",
     ]
     assert fault_calls == [
@@ -363,6 +401,13 @@ def test_run_benchmarks_orchestration_restores_fault_and_policy_override_on_fail
     assert summary["scenarios"]["hpa_sustained"]["observed_max_replicas"] == 2
     assert summary["scenarios"]["hpa_sustained"]["observed_max_ready_replicas"] == 2
     assert summary["scenarios"]["quota_exhaustion"]["block_accuracy"] == 1.0
+    budget_summary = summary["scenarios"]["quota_exhaustion"]["budget_quota_exceeded"]
+    assert budget_summary["denial_reason"] == "budget_quota_exceeded"
+    assert budget_summary["allowed_200"] == 4
+    assert budget_summary["blocked_429"] == 26
+    assert budget_summary["over_budget_leaks_usd"] == 0.0
+    assert budget_summary["block_accuracy"] == 1.0
+    assert budget_summary["policy_denials_metric_delta"] == 26.0
     assert output_path.is_file()
 
     # Now verify finally: restores canonical Policy Bundle even if hpa_sustained k6 fails
@@ -454,6 +499,7 @@ def assert_glossary_compliance(doc_text: str, *, doc_name: str) -> None:
         r"\baccess logs?\b",
         r"\btrace logs?\b",
         r"\bmodel servers?\b",
+        r"\bupstreams?\b",
         r"\bconfig sets?\b",
         r"\brule files?\b",
         r"\bpermission groups?\b",
@@ -518,6 +564,14 @@ def test_latest_benchmark_summary_contains_real_measured_metrics_and_hpa_scale_o
     assert scenarios["failover"]["primary_recovered"] is True
     assert scenarios["quota_exhaustion"]["blocked_429"] > 0
     assert scenarios["quota_exhaustion"]["block_accuracy"] == 1.0
+    budget = scenarios["quota_exhaustion"]["budget_quota_exceeded"]
+    assert budget["denial_reason"] == "budget_quota_exceeded"
+    assert budget["allowed_200"] > 0
+    assert budget["blocked_429"] > 0
+    assert budget["over_budget_leaks_usd"] == 0.0
+    assert budget["headers_valid_rate"] == 1.0
+    assert budget["block_accuracy"] == 1.0
+    assert budget["policy_denials_metric_delta"] > 0
     assert scenarios["hpa_sustained"]["observed_max_replicas"] >= 2
     assert scenarios["hpa_sustained"]["observed_max_ready_replicas"] >= 2
     assert scenarios["hpa_sustained"]["policy_restored"] is True
@@ -528,6 +582,7 @@ def test_benchmarks_doc_and_readme_match_latest_summary_verbatim_and_glossary() 
     overhead = summary["control_plane_overhead_ms"]
     scenarios = summary["scenarios"]
 
+    budget = scenarios["quota_exhaustion"]["budget_quota_exceeded"]
     expected_numbers = [
         f"{overhead['p50_ms']:.3f}",
         f"{overhead['p95_ms']:.3f}",
@@ -538,6 +593,9 @@ def test_benchmarks_doc_and_readme_match_latest_summary_verbatim_and_glossary() 
         f"{scenarios['failover']['latency_ms']['p95']:.3f}",
         f"{scenarios['quota_exhaustion']['allowed_200']}",
         f"{scenarios['quota_exhaustion']['blocked_429']}",
+        f"{budget['allowed_200']}",
+        f"{budget['blocked_429']}",
+        "budget_quota_exceeded",
         f"{scenarios['hpa_sustained']['observed_max_replicas']}",
         f"{scenarios['hpa_sustained']['peak_cpu_utilization_pct']}%",
     ]
@@ -554,6 +612,7 @@ def test_benchmarks_doc_and_readme_match_latest_summary_verbatim_and_glossary() 
     readme_text = readme_path.read_text(encoding="utf-8")
     assert_glossary_compliance(readme_text, doc_name="README.md")
     assert "```mermaid" in readme_text
+    assert 'Grafana -->|"Jaeger Query / TraceQL"| Jaeger' in readme_text
     for required_ref in (
         "make up",
         "make smoke",

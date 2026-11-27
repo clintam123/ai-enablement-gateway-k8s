@@ -1,5 +1,6 @@
-"""Shared canonical domain schemas and Policy Bundle loader."""
+"""Shared canonical domain schemas, Policy Bundle loader, and audit/identity helpers."""
 
+from platform_common.audit import AuditEmitter, AuditSink
 from platform_common.internal_auth import (
     INTERNAL_IDENTITY_AUDIENCE,
     INTERNAL_IDENTITY_HEADER,
@@ -8,6 +9,7 @@ from platform_common.internal_auth import (
     InternalIdentityAssertion,
     InternalIdentityError,
     sign_internal_identity_assertion,
+    validate_internal_identity_secret,
     verify_internal_identity_assertion,
 )
 from platform_common.models import (
@@ -33,12 +35,15 @@ from platform_common.policy import (
     PolicyDefaults,
     SafetyRule,
     TeamPolicy,
+    authorize_mcp_tool,
     load_policy_bundle,
 )
 
 __all__ = [
     "ActorContext",
+    "AuditEmitter",
     "AuditEvent",
+    "AuditSink",
     "ChatCompletionChoice",
     "ChatCompletionChunk",
     "ChatCompletionChunkChoice",
@@ -62,8 +67,10 @@ __all__ = [
     "SafetyRule",
     "StreamOptions",
     "TeamPolicy",
+    "authorize_mcp_tool",
     "build_openai_error",
     "load_policy_bundle",
     "sign_internal_identity_assertion",
+    "validate_internal_identity_secret",
     "verify_internal_identity_assertion",
 ]
