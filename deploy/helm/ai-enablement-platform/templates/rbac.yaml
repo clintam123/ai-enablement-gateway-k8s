@@ -1,5 +1,5 @@
 {{- $root := . -}}
-{{- $components := list "gateway-api" "litellm-proxy" "mock-llm-primary" "mock-llm-fallback" "redis" -}}
+{{- $components := list "gateway-api" "mcp-runtime" "litellm-proxy" "mock-llm-primary" "mock-llm-fallback" "redis" -}}
 {{- range $index, $component := $components -}}
 {{- if $index }}
 ---

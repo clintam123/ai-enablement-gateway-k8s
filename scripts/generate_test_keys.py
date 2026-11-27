@@ -305,6 +305,13 @@ def generate_litellm_master_key(*, seed: str | None = DEFAULT_SEED) -> str:
     return f"sk-litellm-{digest}"
 
 
+def generate_internal_identity_secret(*, seed: str | None = DEFAULT_SEED) -> str:
+    """Create a >=32-byte HS256 secret shared by Control Plane and MCP Runtime."""
+    if seed is not None:
+        return hashlib.sha256(f"{seed}:internal-identity-secret".encode()).hexdigest()
+    return secrets.token_hex(32)
+
+
 def write_local_credential_bundle(
     bundle_dir: Path,
     *,
@@ -319,6 +326,7 @@ def write_local_credential_bundle(
     bundle_dir.mkdir(parents=True, exist_ok=True)
     keypair = generate_rsa_keypair(seed=seed, kid=kid)
     litellm_master_key = generate_litellm_master_key(seed=seed)
+    internal_identity_secret = generate_internal_identity_secret(seed=seed)
 
     api_keys_store: dict[str, dict[str, Any]] = {}
     teams_bundle: dict[str, dict[str, Any]] = {}
@@ -363,12 +371,14 @@ def write_local_credential_bundle(
         "private_pem": keypair.private_pem,
         "public_pem": keypair.public_pem,
         "litellm_master_key": litellm_master_key,
+        "internal_identity_secret": internal_identity_secret,
         "teams": teams_bundle,
     }
     tfvars_doc = {
         "gateway_api_keys_json": json.dumps(api_keys_doc, separators=(",", ":"), sort_keys=True),
         "gateway_jwks_json": json.dumps(keypair.jwks, separators=(",", ":"), sort_keys=True),
         "litellm_master_key": litellm_master_key,
+        "internal_identity_secret": internal_identity_secret,
     }
 
     jwks_path = bundle_dir / "jwks.json"

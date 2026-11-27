@@ -12,6 +12,7 @@ dev-creds:
 build-images:
 	docker build -f services/gateway-api/Dockerfile -t ai-gateway-api:dev .
 	docker build -f services/mock-llm/Dockerfile -t ai-mock-llm:dev .
+	docker build -f services/mcp-runtime/Dockerfile -t ai-mcp-runtime:dev .
 
 up: build-images
 	@if [ ! -f "$(LOCAL_DIR)/local.tfvars.json" ]; then $(MAKE) dev-creds; fi
