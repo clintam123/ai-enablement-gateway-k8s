@@ -26,6 +26,8 @@ gatewayApi:
     repository: ai-gateway-api
     tag: "dev"
     pullPolicy: IfNotPresent
+  serviceAccount:
+    annotations: {}
   replicaCount: 1
   service:
     port: 8000

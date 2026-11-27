@@ -20,6 +20,7 @@ metadata:
     app.kubernetes.io/component: {{ $component }}
   annotations:
     checkov.io/skip1: "CKV_K8S_43=Image tag is parameterized for local Kind builds and immutable release tags"
+    checkov.io/skip2: "CKV_K8S_15=Default IfNotPresent pullPolicy supports offline Kind preloaded images while cloud deployments override to Always"
 spec:
   replicas: {{ $cfg.replicaCount }}
   selector:

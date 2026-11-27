@@ -11,6 +11,7 @@ metadata:
   annotations:
     checkov.io/skip1: "CKV_K8S_40=Official redis:7.4.2-alpine image creates and runs as built-in redis user UID 999"
     checkov.io/skip2: "CKV_K8S_43=Redis image is pinned by version tag redis:7.4.2-alpine"
+    checkov.io/skip3: "CKV_K8S_15=Default IfNotPresent pullPolicy supports offline Kind preloaded images while cloud deployments override to Always"
 spec:
   replicas: {{ .Values.redis.replicaCount }}
   selector:
