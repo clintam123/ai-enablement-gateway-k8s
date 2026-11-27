@@ -129,6 +129,7 @@ resource "kubernetes_service_account_v1" "jaeger" {
 }
 
 resource "kubernetes_deployment_v1" "prometheus" {
+  #checkov:skip=CKV_K8S_15:IfNotPresent pull policy allows Kind preloaded images without remote registry pulls
   #checkov:skip=CKV_K8S_43:Prometheus image is parameterized and pinned by version tag in variables.tf
   count = var.enable_observability ? 1 : 0
 
@@ -326,6 +327,7 @@ resource "kubernetes_service_v1" "prometheus" {
 }
 
 resource "kubernetes_deployment_v1" "grafana" {
+  #checkov:skip=CKV_K8S_15:IfNotPresent pull policy allows Kind preloaded images without remote registry pulls
   #checkov:skip=CKV_K8S_40:Official grafana/grafana image runs as built-in grafana user UID 472
   #checkov:skip=CKV_K8S_43:Grafana image is parameterized and pinned by version tag in variables.tf
   count = var.enable_observability ? 1 : 0
@@ -575,6 +577,7 @@ resource "kubernetes_service_v1" "grafana" {
 }
 
 resource "kubernetes_deployment_v1" "jaeger" {
+  #checkov:skip=CKV_K8S_15:IfNotPresent pull policy allows Kind preloaded images without remote registry pulls
   #checkov:skip=CKV_K8S_43:Jaeger image is parameterized and pinned by version tag in variables.tf
   count = var.enable_observability ? 1 : 0
 

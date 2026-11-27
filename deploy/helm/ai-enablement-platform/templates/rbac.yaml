@@ -5,6 +5,10 @@
 ---
 {{- end }}
 {{- $name := include "ai-enablement-platform.componentName" (dict "root" $root "component" $component) }}
+{{- $saAnnotations := dict -}}
+{{- if and (eq $component "gateway-api") $root.Values.gatewayApi.serviceAccount $root.Values.gatewayApi.serviceAccount.annotations -}}
+{{- $saAnnotations = $root.Values.gatewayApi.serviceAccount.annotations -}}
+{{- end }}
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -13,6 +17,10 @@ metadata:
   labels:
     {{- include "ai-enablement-platform.labels" $root | nindent 4 }}
     app.kubernetes.io/component: {{ $component }}
+  {{- with $saAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
 automountServiceAccountToken: false
 ---
 apiVersion: rbac.authorization.k8s.io/v1

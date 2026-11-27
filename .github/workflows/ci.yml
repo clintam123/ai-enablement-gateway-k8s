@@ -61,6 +61,53 @@ jobs:
           terraform -chdir=terraform/local init -backend=false
           terraform -chdir=terraform/local validate
 
+      - name: Format check and validate GCP Terraform
+        run: |
+          terraform -chdir=terraform/gcp fmt -check -diff
+          terraform -chdir=terraform/gcp init -backend=false
+          terraform -chdir=terraform/gcp validate
+
+      - name: Run blocking Checkov security scans
+        run: |
+          helm template ai-gateway deploy/helm/ai-enablement-platform --namespace ai-gateway > /tmp/helm-rendered.yaml
+          uvx --from checkov checkov -d terraform/local --framework terraform --compact --quiet
+          uvx --from checkov checkov -d terraform/gcp --framework terraform --compact --quiet
+          uvx --from checkov checkov -f /tmp/helm-rendered.yaml --framework kubernetes --compact --quiet
+
+  trivy-scan:
+    name: Container Security Scan (Trivy)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Trivy
+        uses: aquasecurity/setup-trivy@v0.3.1
+        with:
+          version: v0.76.2
+
+      - name: Build custom service images
+        run: |
+          docker build -f services/gateway-api/Dockerfile -t ai-gateway-api:ci .
+          docker build -f services/mcp-runtime/Dockerfile -t ai-mcp-runtime:ci .
+          docker build -f services/mock-llm/Dockerfile -t ai-mock-llm:ci .
+
+      - name: Scan custom images (blocking on fixable CRITICAL/HIGH)
+        run: |
+          trivy image --ignore-unfixed --severity CRITICAL,HIGH --exit-code 1 ai-gateway-api:ci
+          trivy image --ignore-unfixed --severity CRITICAL,HIGH --exit-code 1 ai-mcp-runtime:ci
+          trivy image --ignore-unfixed --severity CRITICAL,HIGH --exit-code 1 ai-mock-llm:ci
+
+      - name: Scan pinned upstream LiteLLM image (non-blocking SARIF)
+        run: |
+          trivy image --ignore-unfixed --severity CRITICAL,HIGH --exit-code 0 --format sarif --output litellm-trivy.sarif ghcr.io/berriai/litellm:1.84.0
+
+      - name: Upload LiteLLM Trivy SARIF report
+        uses: actions/upload-artifact@v4
+        with:
+          name: litellm-trivy-sarif
+          path: litellm-trivy.sarif
+
   kind-smoke:
     name: Live Kind + Calico + Traefik Smoke Suite
     needs: validate-and-test

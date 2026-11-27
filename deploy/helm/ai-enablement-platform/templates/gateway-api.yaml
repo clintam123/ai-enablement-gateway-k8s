@@ -14,6 +14,7 @@ metadata:
   annotations:
     checkov.io/skip1: "CKV_K8S_35=Control Plane reads Model Router API key and optional static JWKS via Secret env vars while API keys mount as a read-only file"
     checkov.io/skip2: "CKV_K8S_43=Image tag is parameterized for local Kind builds and immutable release tags"
+    checkov.io/skip3: "CKV_K8S_15=Default IfNotPresent pullPolicy supports offline Kind preloaded images while cloud deployments override to Always"
 spec:
   {{- if not .Values.gatewayApi.autoscaling.enabled }}
   replicas: {{ .Values.gatewayApi.replicaCount }}
