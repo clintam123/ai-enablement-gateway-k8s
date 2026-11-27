@@ -11,8 +11,10 @@ WORKDIR /app
 
 COPY pyproject.toml uv.lock ./
 COPY packages/platform-common/pyproject.toml packages/platform-common/pyproject.toml
+COPY packages/gateway-sdk/pyproject.toml packages/gateway-sdk/pyproject.toml
 COPY services/gateway-api/pyproject.toml services/gateway-api/pyproject.toml
 COPY services/mock-llm/pyproject.toml services/mock-llm/pyproject.toml
+COPY services/mcp-runtime/pyproject.toml services/mcp-runtime/pyproject.toml
 
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --locked --no-dev --no-editable --no-install-workspace --package gateway-api

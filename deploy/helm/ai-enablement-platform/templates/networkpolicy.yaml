@@ -32,6 +32,7 @@ spec:
         values:
           - gateway-api
           - litellm-proxy
+          - mcp-runtime
   policyTypes:
     - Egress
   egress:
@@ -85,6 +86,13 @@ spec:
       ports:
         - protocol: TCP
           port: {{ .Values.litellmProxy.service.port }}
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "ai-enablement-platform.componentSelectorLabels" (dict "Chart" .Chart "Release" .Release "Values" .Values "component" "mcp-runtime") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.mcpRuntime.service.port }}
     - to:
         - podSelector:
             matchLabels:
@@ -224,7 +232,53 @@ spec:
         - podSelector:
             matchLabels:
               {{- include "ai-enablement-platform.componentSelectorLabels" (dict "Chart" .Chart "Release" .Release "Values" .Values "component" "gateway-api") | nindent 14 }}
+        - podSelector:
+            matchLabels:
+              {{- include "ai-enablement-platform.componentSelectorLabels" (dict "Chart" .Chart "Release" .Release "Values" .Values "component" "mcp-runtime") | nindent 14 }}
       ports:
         - protocol: TCP
           port: {{ .Values.redis.service.port }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "ai-enablement-platform.componentName" (dict "root" . "component" "mcp-runtime") }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ai-enablement-platform.labels" . | nindent 4 }}
+    app.kubernetes.io/component: mcp-runtime
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "ai-enablement-platform.componentSelectorLabels" (dict "Chart" .Chart "Release" .Release "Values" .Values "component" "mcp-runtime") | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "ai-enablement-platform.componentSelectorLabels" (dict "Chart" .Chart "Release" .Release "Values" .Values "component" "gateway-api") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.mcpRuntime.service.port }}
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "ai-enablement-platform.componentSelectorLabels" (dict "Chart" .Chart "Release" .Release "Values" .Values "component" "redis") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.redis.service.port }}
+    {{- if .Values.networkPolicy.allowOtlpEgress }}
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicy.observabilityNamespaceSelector | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 4317
+        - protocol: TCP
+          port: 4318
+    {{- end }}
 {{- end }}

@@ -1,6 +1,7 @@
 {{- $component := "gateway-api" -}}
 {{- $name := include "ai-enablement-platform.componentName" (dict "root" . "component" $component) -}}
 {{- $routerService := include "ai-enablement-platform.componentName" (dict "root" . "component" "litellm-proxy") -}}
+{{- $mcpRuntimeService := include "ai-enablement-platform.componentName" (dict "root" . "component" "mcp-runtime") -}}
 {{- $redisService := include "ai-enablement-platform.componentName" (dict "root" . "component" "redis") -}}
 apiVersion: apps/v1
 kind: Deployment
@@ -54,6 +55,8 @@ spec:
               value: "/etc/gateway/policy-bundle.yaml"
             - name: GATEWAY_MODEL_ROUTER_BASE_URL
               value: {{ printf "http://%s:%d" $routerService (int .Values.litellmProxy.service.port) | quote }}
+            - name: GATEWAY_MCP_RUNTIME_BASE_URL
+              value: {{ printf "http://%s:%d" $mcpRuntimeService (int .Values.mcpRuntime.service.port) | quote }}
             - name: GATEWAY_REDIS_URL
               value: {{ printf "redis://%s:%d/0" $redisService (int .Values.redis.service.port) | quote }}
             - name: GATEWAY_REQUIRE_REDIS
@@ -77,6 +80,11 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.secrets.gateway.existingSecret }}
                   key: {{ .Values.secrets.gateway.routerApiKeyKey }}
+            - name: GATEWAY_INTERNAL_IDENTITY_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.gateway.existingSecret }}
+                  key: {{ .Values.secrets.gateway.internalIdentitySecretKey }}
             {{- if .Values.gatewayApi.jwt.jwksUrl }}
             - name: GATEWAY_JWT_JWKS_URL
               value: {{ .Values.gatewayApi.jwt.jwksUrl | quote }}

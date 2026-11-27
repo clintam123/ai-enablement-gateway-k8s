@@ -58,6 +58,18 @@ variable "mock_llm_image_tag" {
   default     = "dev"
 }
 
+variable "mcp_runtime_image_repository" {
+  description = "Local Docker image repository for the Guarded MCP Runtime (mcp-runtime)."
+  type        = string
+  default     = "ai-mcp-runtime"
+}
+
+variable "mcp_runtime_image_tag" {
+  description = "Local Docker image tag for the Guarded MCP Runtime (mcp-runtime)."
+  type        = string
+  default     = "dev"
+}
+
 variable "litellm_image" {
   description = "Pinned Model Router (LiteLLM Proxy) image pre-loaded into Kind when cached locally."
   type        = string
@@ -86,6 +98,13 @@ variable "gateway_jwks_json" {
 
 variable "litellm_master_key" {
   description = "Internal Model Router master key shared between gateway-api and litellm-proxy Secrets."
+  type        = string
+  default     = ""
+  sensitive   = true
+}
+
+variable "internal_identity_secret" {
+  description = "HS256 signing secret (>=32 bytes) shared between gateway-api and mcp-runtime Secrets."
   type        = string
   default     = ""
   sensitive   = true

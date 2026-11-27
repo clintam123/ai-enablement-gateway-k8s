@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import json
 import os
 import socket
 import subprocess
 import sys
 import time
+import uuid
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -39,6 +41,17 @@ except ModuleNotFoundError:  # Invoked directly as `python scripts/smoke_test.py
 DEFAULT_BASE_URL = "http://localhost:8080"
 DEFAULT_CREDENTIALS_PATH = Path(".local/credentials.json")
 DEFAULT_NAMESPACE = "ai-gateway"
+DEFAULT_OBSERVABILITY_NAMESPACE = "observability"
+_MCP_HEADERS = {
+    "Content-Type": "application/json",
+    "Accept": "application/json, text/event-stream",
+}
+_EXPECTED_SLO_ALERTS = {
+    "GatewayHighP95Overhead",
+    "GatewayHigh5xxErrorRate",
+    "GatewayHighUpstreamFailoverRate",
+    "GatewayTeamBudgetQuotaExhaustion",
+}
 
 
 class SmokeAssertionError(AssertionError):
@@ -159,6 +172,25 @@ def _require(condition: bool, message: str) -> None:
         raise SmokeAssertionError(message)
 
 
+def _make_trace_context() -> tuple[str, str]:
+    trace_id = uuid.uuid4().hex
+    return trace_id, f"00-{trace_id}-00f067aa0ba902b7-01"
+
+
+def _extract_mcp_tool_json(rpc_payload: dict[str, Any]) -> dict[str, Any]:
+    result = rpc_payload.get("result")
+    _require(isinstance(result, dict), f"Malformed MCP JSON-RPC result: {rpc_payload}")
+    assert isinstance(result, dict)
+    if isinstance(result.get("structuredContent"), dict):
+        return result["structuredContent"]
+    content = result.get("content")
+    _require(
+        isinstance(content, list) and bool(content) and isinstance(content[0].get("text"), str),
+        f"Missing MCP tool text content: {rpc_payload}",
+    )
+    return json.loads(content[0]["text"])
+
+
 async def _wait_for_gateway_ready(
     client: httpx.AsyncClient,
     timeout_seconds: float,
@@ -196,8 +228,9 @@ async def _check_auth_and_rbac(
     platform_jwt: str,
     ops_api_key: str,
     product_api_key: str,
-) -> list[SmokeCheckResult]:
+) -> tuple[list[SmokeCheckResult], str]:
     # Check 2: Auth enforcement (missing/invalid -> 401; valid JWT & sk-gw- key -> 200)
+    chat_trace_id, chat_traceparent = _make_trace_context()
     payload = {
         "model": "chat-default",
         "messages": [{"role": "user", "content": "Smoke test auth check"}],
@@ -221,7 +254,10 @@ async def _check_auth_and_rbac(
     jwt_resp = await client.post(
         "/v1/chat/completions",
         json=payload,
-        headers={"Authorization": f"Bearer {platform_jwt}"},
+        headers={
+            "Authorization": f"Bearer {platform_jwt}",
+            "traceparent": chat_traceparent,
+        },
     )
     _require(
         jwt_resp.status_code == 200,
@@ -260,18 +296,21 @@ async def _check_auth_and_rbac(
         f"Expected error.code=model_not_allowed, got {rbac_error}",
     )
 
-    return [
-        SmokeCheckResult(
-            "auth_jwt_and_api_key",
-            True,
-            "401 on missing/invalid, 200 on JWT & sk-gw-",
-        ),
-        SmokeCheckResult(
-            "team_model_alias_rbac",
-            True,
-            "403 model_not_allowed for product-eng -> chat-premium",
-        ),
-    ]
+    return (
+        [
+            SmokeCheckResult(
+                "auth_jwt_and_api_key",
+                True,
+                "401 on missing/invalid, 200 on JWT & sk-gw-",
+            ),
+            SmokeCheckResult(
+                "team_model_alias_rbac",
+                True,
+                "403 model_not_allowed for product-eng -> chat-premium",
+            ),
+        ],
+        chat_trace_id,
+    )
 
 
 async def _check_guardrails_and_streaming(
@@ -682,17 +721,503 @@ def _check_network_policy_enforcement(
     )
 
 
+async def _check_mcp_tools_rbac_and_loop_cap(
+    client: httpx.AsyncClient,
+    *,
+    ops_api_key: str,
+    product_api_key: str,
+) -> tuple[SmokeCheckResult, str]:
+    mcp_trace_id, mcp_traceparent = _make_trace_context()
+    ops_run_id = f"smoke-ops-{uuid.uuid4().hex[:8]}"
+    dev_run_id = f"smoke-dev-{uuid.uuid4().hex[:8]}"
+
+    # ops calls lookup_service_slo & query_runbook -> 200
+    slo_resp = await client.post(
+        "/mcp",
+        json={
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "lookup_service_slo",
+                "arguments": {"service_name": "gateway-api"},
+            },
+        },
+        headers={
+            **_MCP_HEADERS,
+            "Authorization": f"Bearer {ops_api_key}",
+            "X-Run-Id": ops_run_id,
+            "traceparent": mcp_traceparent,
+        },
+    )
+    _require(
+        slo_resp.status_code == 200,
+        f"Expected 200 for ops lookup_service_slo, got {slo_resp.status_code}: {slo_resp.text}",
+    )
+    _require(
+        slo_resp.headers.get("x-trace-id") == mcp_trace_id,
+        f"Expected x-trace-id={mcp_trace_id}, got {slo_resp.headers.get('x-trace-id')}",
+    )
+    slo_data = _extract_mcp_tool_json(slo_resp.json())
+    _require(
+        slo_data.get("found") is True and slo_data.get("service_name") == "gateway-api",
+        f"Unexpected lookup_service_slo output: {slo_data}",
+    )
+
+    runbook_resp = await client.post(
+        "/mcp",
+        json={
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {"name": "query_runbook", "arguments": {"query": "failover"}},
+        },
+        headers={
+            **_MCP_HEADERS,
+            "Authorization": f"Bearer {ops_api_key}",
+            "X-Run-Id": ops_run_id,
+        },
+    )
+    _require(
+        runbook_resp.status_code == 200,
+        f"Expected 200 for ops query_runbook, got {runbook_resp.status_code}: {runbook_resp.text}",
+    )
+    runbook_data = _extract_mcp_tool_json(runbook_resp.json())
+    _require(
+        int(runbook_data.get("match_count", 0)) >= 1,
+        f"Expected >=1 runbook match, got {runbook_data}",
+    )
+
+    # developer calls own-Team check_model_catalog -> 200
+    own_catalog_resp = await client.post(
+        "/mcp",
+        json={
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {"name": "check_model_catalog", "arguments": {"team": "product-eng"}},
+        },
+        headers={
+            **_MCP_HEADERS,
+            "Authorization": f"Bearer {product_api_key}",
+            "X-Run-Id": dev_run_id,
+        },
+    )
+    _require(
+        own_catalog_resp.status_code == 200,
+        "Expected 200 for developer own-Team check_model_catalog, "
+        f"got {own_catalog_resp.status_code}: {own_catalog_resp.text}",
+    )
+    own_catalog_data = _extract_mcp_tool_json(own_catalog_resp.json())
+    _require(
+        own_catalog_data.get("found") is True and own_catalog_data.get("team") == "product-eng",
+        f"Unexpected check_model_catalog output: {own_catalog_data}",
+    )
+
+    # developer denied lookup_service_slo -> 403
+    denied_slo = await client.post(
+        "/mcp",
+        json={
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tools/call",
+            "params": {
+                "name": "lookup_service_slo",
+                "arguments": {"service_name": "gateway-api"},
+            },
+        },
+        headers={
+            **_MCP_HEADERS,
+            "Authorization": f"Bearer {product_api_key}",
+            "X-Run-Id": dev_run_id,
+        },
+    )
+    _require(
+        denied_slo.status_code == 403,
+        f"Expected 403 for developer lookup_service_slo, got {denied_slo.status_code}",
+    )
+    _require(
+        denied_slo.headers.get("x-policy-denial-reason") == "mcp_tool_not_allowed",
+        f"Expected mcp_tool_not_allowed, got {dict(denied_slo.headers)}",
+    )
+
+    # developer denied cross-Team check_model_catalog -> 403
+    denied_cross = await client.post(
+        "/mcp",
+        json={
+            "jsonrpc": "2.0",
+            "id": 5,
+            "method": "tools/call",
+            "params": {"name": "check_model_catalog", "arguments": {"team": "platform-eng"}},
+        },
+        headers={
+            **_MCP_HEADERS,
+            "Authorization": f"Bearer {product_api_key}",
+            "X-Run-Id": dev_run_id,
+        },
+    )
+    _require(
+        denied_cross.status_code == 403,
+        "Expected 403 for developer cross-Team check_model_catalog, "
+        f"got {denied_cross.status_code}",
+    )
+    _require(
+        denied_cross.headers.get("x-policy-denial-reason") == "mcp_cross_team_denied",
+        f"Expected mcp_cross_team_denied, got {dict(denied_cross.headers)}",
+    )
+
+    # Server-side Run loop cap -> 429 on (max+1)th call
+    loop_run_id = f"smoke-loop-{uuid.uuid4().hex[:8]}"
+    first_loop_resp = await client.post(
+        "/mcp",
+        json={
+            "jsonrpc": "2.0",
+            "id": 10,
+            "method": "tools/call",
+            "params": {"name": "query_runbook", "arguments": {"query": "loop"}},
+        },
+        headers={
+            **_MCP_HEADERS,
+            "Authorization": f"Bearer {ops_api_key}",
+            "X-Run-Id": loop_run_id,
+        },
+    )
+    _require(
+        first_loop_resp.status_code == 200,
+        f"Expected 200 on first loop-cap check call, got {first_loop_resp.status_code}",
+    )
+    run_limit = int(first_loop_resp.headers["x-mcp-run-limit"])
+    _require(run_limit >= 1, f"Invalid x-mcp-run-limit header: {run_limit}")
+
+    for call_num in range(2, run_limit + 1):
+        ok_resp = await client.post(
+            "/mcp",
+            json={
+                "jsonrpc": "2.0",
+                "id": 10 + call_num,
+                "method": "tools/call",
+                "params": {"name": "query_runbook", "arguments": {"query": "loop"}},
+            },
+            headers={
+                **_MCP_HEADERS,
+                "Authorization": f"Bearer {ops_api_key}",
+                "X-Run-Id": loop_run_id,
+            },
+        )
+        _require(
+            ok_resp.status_code == 200,
+            f"Expected 200 on Run call {call_num}/{run_limit}, got {ok_resp.status_code}",
+        )
+
+    capped_resp = await client.post(
+        "/mcp",
+        json={
+            "jsonrpc": "2.0",
+            "id": 99,
+            "method": "tools/call",
+            "params": {"name": "query_runbook", "arguments": {"query": "loop"}},
+        },
+        headers={
+            **_MCP_HEADERS,
+            "Authorization": f"Bearer {ops_api_key}",
+            "X-Run-Id": loop_run_id,
+        },
+    )
+    _require(
+        capped_resp.status_code == 429,
+        f"Expected 429 on Run call {run_limit + 1}, "
+        f"got {capped_resp.status_code}: {capped_resp.text}",
+    )
+    _require(
+        capped_resp.headers.get("x-policy-denial-reason") == "mcp_run_loop_cap_exceeded",
+        "Expected x-policy-denial-reason=mcp_run_loop_cap_exceeded, "
+        f"got {dict(capped_resp.headers)}",
+    )
+
+    return (
+        SmokeCheckResult(
+            "mcp_tools_rbac_and_loop_cap",
+            True,
+            f"ops/dev tools allowed, 403 RBAC enforced, 429 loop cap triggered at {run_limit + 1}",
+        ),
+        mcp_trace_id,
+    )
+
+
+def _check_mcp_network_policy_enforcement(
+    *,
+    namespace: str,
+    kubectl_runner: KubectlRunner,
+) -> SmokeCheckResult:
+    for blocked_host, blocked_port in (
+        ("ai-gateway-litellm-proxy", 4000),
+        ("1.1.1.1", 443),
+    ):
+        blocked_proc = kubectl_runner(
+            [
+                "exec",
+                "-n",
+                namespace,
+                "deploy/ai-gateway-mcp-runtime",
+                "--",
+                "python",
+                "-c",
+                _tcp_probe_script(blocked_host, blocked_port),
+            ]
+        )
+        _require(
+            blocked_proc.returncode == 3 and "BLOCKED:" in blocked_proc.stdout,
+            f"NetworkPolicy failed to block mcp-runtime -> {blocked_host}:{blocked_port} "
+            f"(rc={blocked_proc.returncode}, stdout={blocked_proc.stdout!r}, "
+            f"stderr={blocked_proc.stderr!r})",
+        )
+
+    allowed_proc = kubectl_runner(
+        [
+            "exec",
+            "-n",
+            namespace,
+            "deploy/ai-gateway-mcp-runtime",
+            "--",
+            "python",
+            "-c",
+            _tcp_probe_script("ai-gateway-redis", 6379),
+        ]
+    )
+    _require(
+        allowed_proc.returncode == 0 and "CONNECTED" in allowed_proc.stdout,
+        "Expected mcp-runtime -> ai-gateway-redis:6379 to succeed "
+        f"(rc={allowed_proc.returncode}, stdout={allowed_proc.stdout!r}, "
+        f"stderr={allowed_proc.stderr!r})",
+    )
+
+    return SmokeCheckResult(
+        "mcp_network_policy_enforcement",
+        True,
+        "mcp-runtime -> litellm-proxy:4000 & 1.1.1.1:443 blocked; -> ai-gateway-redis:6379 allowed",
+    )
+
+
+def _make_port_forward_client(
+    local_port: int,
+    http_transport: httpx.AsyncBaseTransport | None,
+) -> httpx.AsyncClient:
+    kwargs: dict[str, Any] = {
+        "base_url": f"http://127.0.0.1:{local_port}",
+        "timeout": httpx.Timeout(10.0),
+    }
+    if http_transport is not None:
+        kwargs["transport"] = http_transport
+    return httpx.AsyncClient(**kwargs)
+
+
+async def _check_prometheus_observability(
+    *,
+    observability_namespace: str,
+    http_transport: httpx.AsyncBaseTransport | None,
+    port_forward_factory: PortForwardFactory,
+    timeout_seconds: float,
+) -> SmokeCheckResult:
+    with port_forward_factory("svc/prometheus", 9090, observability_namespace) as local_port:
+        async with _make_port_forward_client(local_port, http_transport) as prom_client:
+            deadline = time.monotonic() + timeout_seconds
+            up_count = 0
+            last_targets: Any = None
+            while True:
+                targets_resp = await prom_client.get("/api/v1/targets")
+                if targets_resp.status_code == 200:
+                    targets_doc = targets_resp.json()
+                    active = targets_doc.get("data", {}).get("activeTargets", [])
+                    last_targets = active
+                    up_targets = [
+                        t
+                        for t in active
+                        if t.get("labels", {}).get("job") == "ai-gateway-control-plane"
+                        and t.get("health") == "up"
+                    ]
+                    if up_targets:
+                        up_count = len(up_targets)
+                        break
+                if time.monotonic() >= deadline:
+                    raise SmokeAssertionError(
+                        "Prometheus ai-gateway-control-plane target not UP within "
+                        f"{timeout_seconds}s: {last_targets}"
+                    )
+                await asyncio.sleep(2.0)
+
+            rules_resp = await prom_client.get("/api/v1/rules")
+            _require(
+                rules_resp.status_code == 200,
+                f"Prometheus /api/v1/rules failed: {rules_resp.status_code}",
+            )
+            groups = rules_resp.json().get("data", {}).get("groups", [])
+            slo_groups = [g for g in groups if g.get("name") == "ai-enablement-gateway-slo"]
+            _require(bool(slo_groups), f"Missing ai-enablement-gateway-slo rule group: {groups}")
+            rule_names = {r.get("name") for r in slo_groups[0].get("rules", [])}
+            _require(
+                _EXPECTED_SLO_ALERTS.issubset(rule_names),
+                f"Missing SLO alerts: {_EXPECTED_SLO_ALERTS - rule_names}",
+            )
+
+    return SmokeCheckResult(
+        "observability_prometheus",
+        True,
+        f"{up_count} gateway target(s) UP and {len(_EXPECTED_SLO_ALERTS)} SLO rules loaded",
+    )
+
+
+async def _check_grafana_observability(
+    *,
+    observability_namespace: str,
+    http_transport: httpx.AsyncBaseTransport | None,
+    port_forward_factory: PortForwardFactory,
+) -> SmokeCheckResult:
+    with port_forward_factory("svc/grafana", 3000, observability_namespace) as local_port:
+        async with _make_port_forward_client(local_port, http_transport) as grafana_client:
+            ds_resp = await grafana_client.get("/api/datasources")
+            if ds_resp.status_code == 200:
+                datasources = ds_resp.json()
+                ds_uids = {ds.get("uid") for ds in datasources if isinstance(ds, dict)}
+            else:
+                settings_resp = await grafana_client.get("/api/frontend/settings")
+                _require(
+                    settings_resp.status_code == 200,
+                    f"Grafana datasources/settings failed: {ds_resp.status_code} / "
+                    f"{settings_resp.status_code}",
+                )
+                ds_map = settings_resp.json().get("datasources", {})
+                ds_uids = {
+                    info.get("uid")
+                    for info in ds_map.values()
+                    if isinstance(info, dict) and info.get("uid")
+                }
+            _require(
+                {"prometheus", "jaeger"}.issubset(ds_uids),
+                f"Missing provisioned Grafana datasources (found {ds_uids})",
+            )
+
+            dash_resp = await grafana_client.get("/api/dashboards/uid/ai-gateway-overview")
+            _require(
+                dash_resp.status_code == 200,
+                f"Grafana dashboard ai-gateway-overview failed: {dash_resp.status_code}",
+            )
+            dash = dash_resp.json().get("dashboard", {})
+            _require(
+                dash.get("uid") == "ai-gateway-overview" and len(dash.get("panels") or []) >= 6,
+                f"Unexpected Grafana dashboard payload: {dash}",
+            )
+
+    return SmokeCheckResult(
+        "observability_grafana",
+        True,
+        "Prometheus + Jaeger datasources & ai-gateway-overview dashboard provisioned",
+    )
+
+
+def _decode_otlp_trace_id(raw_trace_id: str) -> str:
+    cleaned = raw_trace_id.strip()
+    if len(cleaned) == 32:
+        return cleaned.lower()
+    try:
+        decoded = base64.b64decode(cleaned, validate=True)
+        if len(decoded) == 16:
+            return decoded.hex()
+    except ValueError:
+        pass
+    return cleaned.lower()
+
+
+def _extract_jaeger_services_and_trace_ids(trace_doc: dict[str, Any]) -> tuple[set[str], set[str]]:
+    services: set[str] = set()
+    trace_ids: set[str] = set()
+    resource_spans = trace_doc.get("result", {}).get("resourceSpans") or []
+    for res_span in resource_spans:
+        attrs = res_span.get("resource", {}).get("attributes") or []
+        for attr in attrs:
+            if attr.get("key") == "service.name":
+                svc_val = attr.get("value", {}).get("stringValue")
+                if isinstance(svc_val, str) and svc_val:
+                    services.add(svc_val)
+        for scope_span in res_span.get("scopeSpans") or []:
+            for span in scope_span.get("spans") or []:
+                raw_tid = span.get("traceId")
+                if isinstance(raw_tid, str) and raw_tid:
+                    trace_ids.add(_decode_otlp_trace_id(raw_tid))
+    return services, trace_ids
+
+
+async def _poll_jaeger_trace(
+    jaeger_client: httpx.AsyncClient,
+    trace_id: str,
+    *,
+    required_services: set[str],
+    timeout_seconds: float,
+) -> set[str]:
+    deadline = time.monotonic() + timeout_seconds
+    last_detail: Any = "no trace yet"
+    while True:
+        resp = await jaeger_client.get(f"/api/v3/traces/{trace_id}")
+        if resp.status_code == 200:
+            doc = resp.json()
+            services, found_trace_ids = _extract_jaeger_services_and_trace_ids(doc)
+            if trace_id in found_trace_ids and required_services.issubset(services):
+                return services
+            last_detail = {"services": sorted(services), "trace_ids": sorted(found_trace_ids)}
+        else:
+            last_detail = f"HTTP {resp.status_code}"
+        if time.monotonic() >= deadline:
+            raise SmokeAssertionError(
+                f"Jaeger trace {trace_id} missing required services {sorted(required_services)} "
+                f"within {timeout_seconds}s: {last_detail}"
+            )
+        await asyncio.sleep(1.5)
+
+
+async def _check_jaeger_traces(
+    *,
+    observability_namespace: str,
+    chat_trace_id: str,
+    mcp_trace_id: str,
+    http_transport: httpx.AsyncBaseTransport | None,
+    port_forward_factory: PortForwardFactory,
+    timeout_seconds: float,
+) -> SmokeCheckResult:
+    with port_forward_factory("svc/jaeger", 16686, observability_namespace) as local_port:
+        async with _make_port_forward_client(local_port, http_transport) as jaeger_client:
+            chat_services = await _poll_jaeger_trace(
+                jaeger_client,
+                chat_trace_id,
+                required_services={"gateway-api"},
+                timeout_seconds=timeout_seconds,
+            )
+            mcp_services = await _poll_jaeger_trace(
+                jaeger_client,
+                mcp_trace_id,
+                required_services={"gateway-api", "mcp-runtime"},
+                timeout_seconds=timeout_seconds,
+            )
+
+    return SmokeCheckResult(
+        "observability_jaeger_traces",
+        True,
+        f"chat trace {chat_trace_id[:8]}.. ({sorted(chat_services)}); "
+        f"mcp trace {mcp_trace_id[:8]}.. ({sorted(mcp_services)})",
+    )
+
+
 async def run_smoke_suite(
     *,
     base_url: str = DEFAULT_BASE_URL,
     credentials_path: Path = DEFAULT_CREDENTIALS_PATH,
     namespace: str = DEFAULT_NAMESPACE,
+    observability_namespace: str = DEFAULT_OBSERVABILITY_NAMESPACE,
     http_transport: httpx.AsyncBaseTransport | None = None,
     kubectl_runner: KubectlRunner = _default_kubectl_runner,
     port_forward_factory: PortForwardFactory = _default_port_forward,
     avoid_minute_rollover: bool = True,
+    check_observability: bool = False,
 ) -> list[SmokeCheckResult]:
-    """Execute the full 10-point live smoke verification suite."""
+    """Execute the live smoke verification suite against Kind + Calico + Traefik."""
     bundle = _load_credentials(credentials_path)
     platform_jwt = _fresh_rs256_jwt(bundle, "platform-eng")
     product_api_key = str(bundle["teams"]["product-eng"]["api_key"])
@@ -709,6 +1234,7 @@ async def run_smoke_suite(
     readiness_timeout = 30.0 if avoid_minute_rollover else 2.0
     recovery_timeout = 45.0 if avoid_minute_rollover else 2.0
     metrics_timeout = 90.0 if avoid_minute_rollover else 1.0
+    observability_timeout = 45.0 if avoid_minute_rollover else 1.0
 
     async with httpx.AsyncClient(**client_kwargs) as client:
         # 1. /healthz and /readyz via Traefik Ingress
@@ -722,14 +1248,13 @@ async def run_smoke_suite(
         )
 
         # 2 & 3. Auth + Team Model Alias RBAC
-        results.extend(
-            await _check_auth_and_rbac(
-                client,
-                platform_jwt=platform_jwt,
-                ops_api_key=ops_api_key,
-                product_api_key=product_api_key,
-            )
+        auth_results, chat_trace_id = await _check_auth_and_rbac(
+            client,
+            platform_jwt=platform_jwt,
+            ops_api_key=ops_api_key,
+            product_api_key=product_api_key,
         )
+        results.extend(auth_results)
 
         # 4 & 5. Pre-call guardrails & SSE streaming
         results.extend(await _check_guardrails_and_streaming(client, platform_jwt=platform_jwt))
@@ -765,7 +1290,15 @@ async def run_smoke_suite(
             )
         )
 
-    # 9. metrics-server (kubectl top pods & HPA CPU utilization)
+        # 9. /mcp via Traefik Ingress: ops & developer tools, RBAC denials, server-side Run cap
+        mcp_result, mcp_trace_id = await _check_mcp_tools_rbac_and_loop_cap(
+            client,
+            ops_api_key=ops_api_key,
+            product_api_key=product_api_key,
+        )
+        results.append(mcp_result)
+
+    # 10. metrics-server (kubectl top pods & HPA CPU utilization)
     results.append(
         await _check_metrics_server_and_hpa(
             namespace=namespace,
@@ -774,13 +1307,46 @@ async def run_smoke_suite(
         )
     )
 
-    # 10. Negative & positive Calico NetworkPolicy probes
+    # 11 & 12. Negative & positive Calico NetworkPolicy probes (gateway-api & mcp-runtime)
     results.append(
         _check_network_policy_enforcement(
             namespace=namespace,
             kubectl_runner=kubectl_runner,
         )
     )
+    results.append(
+        _check_mcp_network_policy_enforcement(
+            namespace=namespace,
+            kubectl_runner=kubectl_runner,
+        )
+    )
+
+    if check_observability:
+        results.append(
+            await _check_prometheus_observability(
+                observability_namespace=observability_namespace,
+                http_transport=http_transport,
+                port_forward_factory=port_forward_factory,
+                timeout_seconds=observability_timeout,
+            )
+        )
+        results.append(
+            await _check_grafana_observability(
+                observability_namespace=observability_namespace,
+                http_transport=http_transport,
+                port_forward_factory=port_forward_factory,
+            )
+        )
+        results.append(
+            await _check_jaeger_traces(
+                observability_namespace=observability_namespace,
+                chat_trace_id=chat_trace_id,
+                mcp_trace_id=mcp_trace_id,
+                http_transport=http_transport,
+                port_forward_factory=port_forward_factory,
+                timeout_seconds=observability_timeout,
+            )
+        )
 
     return results
 
@@ -796,6 +1362,15 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=Path(os.getenv("SMOKE_CREDENTIALS_PATH", str(DEFAULT_CREDENTIALS_PATH))),
     )
     parser.add_argument("--namespace", default=os.getenv("SMOKE_NAMESPACE", DEFAULT_NAMESPACE))
+    parser.add_argument(
+        "--observability-namespace",
+        default=os.getenv("SMOKE_OBSERVABILITY_NAMESPACE", DEFAULT_OBSERVABILITY_NAMESPACE),
+    )
+    parser.add_argument(
+        "--check-observability",
+        action="store_true",
+        help="Verify Prometheus targets/alerts, Grafana datasources/dashboard, and Jaeger traces.",
+    )
     return parser.parse_args(argv)
 
 
@@ -808,6 +1383,8 @@ def main(argv: list[str] | None = None) -> int:
                 base_url=args.base_url,
                 credentials_path=args.credentials,
                 namespace=args.namespace,
+                observability_namespace=args.observability_namespace,
+                check_observability=args.check_observability,
             )
         )
     except SmokeAssertionError as exc:

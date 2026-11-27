@@ -12,6 +12,10 @@ secrets:
     apiKeysKey: api-keys.json
     jwksKey: jwks.json
     routerApiKeyKey: litellm-master-key
+    internalIdentitySecretKey: internal-identity-secret
+  mcpRuntime:
+    existingSecret: ai-gateway-mcp-credentials
+    internalIdentitySecretKey: internal-identity-secret
   router:
     existingSecret: ai-gateway-router-credentials
     masterKeyKey: litellm-master-key
@@ -38,6 +42,25 @@ gatewayApi:
     targetCPUUtilizationPercentage: 50
     scaleUpStabilizationWindowSeconds: 15
     scaleDownStabilizationWindowSeconds: 60
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+mcpRuntime:
+  image:
+    repository: ai-mcp-runtime
+    tag: "dev"
+    pullPolicy: IfNotPresent
+  replicaCount: 1
+  service:
+    port: 8002
+  toolTimeoutSeconds: 5.0
+  maxToolCallsPerRun: 5
+  runTtlSeconds: 3600
   resources:
     requests:
       cpu: 100m

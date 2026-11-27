@@ -12,6 +12,7 @@ resolution-markers = [
 members = [
     "ai-enablement-gateway",
     "gateway-api",
+    "gateway-sdk",
     "mcp-runtime",
     "mock-llm",
     "platform-common",
@@ -23,6 +24,7 @@ version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
     { name = "gateway-api" },
+    { name = "gateway-sdk" },
     { name = "mcp-runtime" },
     { name = "mock-llm" },
     { name = "platform-common" },
@@ -40,6 +42,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "gateway-api", editable = "services/gateway-api" },
+    { name = "gateway-sdk", editable = "packages/gateway-sdk" },
     { name = "mcp-runtime", editable = "services/mcp-runtime" },
     { name = "mock-llm", editable = "services/mock-llm" },
     { name = "platform-common", editable = "packages/platform-common" },
@@ -468,6 +471,17 @@ requires-dist = [
     { name = "redis", specifier = ">=5.0.0" },
     { name = "uvicorn", specifier = ">=0.34.0" },
 ]
+
+[[package]]
+name = "gateway-sdk"
+version = "0.1.0"
+source = { editable = "packages/gateway-sdk" }
+dependencies = [
+    { name = "httpx" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "httpx", specifier = ">=0.28.1" }]
 
 [[package]]
 name = "googleapis-common-protos"
